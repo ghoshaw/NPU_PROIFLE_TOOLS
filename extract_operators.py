@@ -114,6 +114,24 @@ def calculate_flops_mfu(M: Optional[int], K: Optional[int], N: Optional[int],
     return None, None
 
 
+def calculate_flops_mbu(M: Optional[int], K: Optional[int], N: Optional[int],
+                        B: Optional[int], S: Optional[int], S_key: Optional[int], D: Optional[int],
+                        op_type: str, duration_us: float) -> Tuple[Optional[float], Optional[float]]:
+    if duration_us <= 0:
+        return None, None
+
+    flops = None
+
+    if op_type.startswith('MatMul') or op_type.startswith('GroupedMatmul'):
+        if M is not None and K is not None and N is not None:
+            flops = (M * K + K * N + M * N) * 2
+
+    if flops is not None:
+        mbu = flops / (4.0 * duration_us * 1_000_000.0)
+        return flops, mbu
+
+    return None, None
+
 def process_kernel_details(csv_path: Path) -> List[Dict[str, Any]]:
     results = []
 
@@ -147,11 +165,13 @@ def process_kernel_details(csv_path: Path) -> List[Dict[str, Any]]:
 
             M, K, N = None, None, None
             B, N_head, S, S_key, D = None, None, None, None, None
-            flops, mfu = None, None
+            flops, flops_bw, mfu, mbu, I = None, None, None, None, None
 
             if is_matmul or is_grouped:
                 M, K, N = extract_matmul_dims(input_shapes, output_shapes, is_grouped)
                 flops, mfu = calculate_flops_mfu(M, K, N, None, None, None, None, type_val, duration_us)
+                flops_bw, mbu = calculate_flops_mbu(M, K, N, None, None, None, None, type_val, duration_us)
+                I = flops / flops_bw
             elif is_fa or is_fa_grad:
                 B, N_head, S, D, S_key = extract_fa_dims(input_shapes)
                 flops, mfu = calculate_flops_mfu(None, None, N_head, B, S, S_key, D, type_val, duration_us)
@@ -167,6 +187,9 @@ def process_kernel_details(csv_path: Path) -> List[Dict[str, Any]]:
             result_row['D'] = D if D is not None else ''
             result_row['FLOPs'] = flops if flops is not None else ''
             result_row['MFU'] = mfu if mfu is not None else ''
+            result_row['MBU'] = mbu if mbu is not None else ''
+            result_row['I'] = I if I is not None else ''
+            result_row['AI'] = 432/4.0
             result_row['source_path'] = csv_path.parent.parent.name if csv_path else ''
 
             results.append(result_row)
@@ -306,14 +329,6 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
         avg_row['contribution_to_model_mfu'] = contribution_mfu
         new_rows.append(avg_row)
 
-        mid_row = create_empty_row(new_headers)
-        mid_row[new_col_name] = 'mid'
-        mid_row['MFU'] = mid_mfu
-        mid_row['op_count'] = op_count
-        mid_row['total_duration(us)'] = total_duration
-        mid_row['model_runtime(us)'] = model_runtime
-        mid_row['time_ratio(%)'] = time_ratio * 100
-        new_rows.append(mid_row)
 
     for col in ['op_count', 'total_duration(us)', 'model_runtime(us)', 'time_ratio(%)', 'contribution_to_model_mfu']:
         if col not in new_headers:

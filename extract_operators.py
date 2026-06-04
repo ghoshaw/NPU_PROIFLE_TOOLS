@@ -185,10 +185,10 @@ def process_kernel_details(csv_path: Path) -> List[Dict[str, Any]]:
             result_row['S_q'] = S if S is not None else ''
             result_row['S_k'] = S_key if S_key is not None else ''
             result_row['D'] = D if D is not None else ''
-            result_row['FLOPs'] = flops if flops is not None else ''
-            result_row['MFU'] = mfu if mfu is not None else ''
-            result_row['MBU'] = mbu if mbu is not None else ''
-            result_row['I'] = I if I is not None else ''
+            result_row['FLOPs'] = _round(flops) if flops is not None else ''
+            result_row['MFU'] = _round(mfu*100) if mfu is not None else ''
+            result_row['MBU'] = _round(mbu) if mbu is not None else ''
+            result_row['I'] = _round(I) if I is not None else ''
             result_row['AI'] = 432/4.0
             result_row['source_path'] = csv_path.parent.parent.name if csv_path else ''
 
@@ -250,6 +250,12 @@ def create_empty_row(headers: List[str]) -> Dict[str, str]:
     return {h: '' for h in headers}
 
 
+def _round(v):
+    """保留4位小数"""
+    if isinstance(v, (int, float)) and v != '':
+        return round(v, 4)
+    return v
+
 def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], model_runtime: float) -> List[Dict[str, Any]]:
     groups = defaultdict(list)
     for row in all_results:
@@ -294,29 +300,29 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
         max_row = dict(sorted_items[-1])
 
         mfu_values = [float(item['MFU']) for item in sorted_items]
-        avg_mfu = sum(mfu_values) / len(mfu_values)
-        mid_mfu = statistics.median(mfu_values)
+        avg_mfu = _round(sum(mfu_values) / len(mfu_values))
+        mid_mfu = _round(statistics.median(mfu_values))
 
-        total_duration = sum(float(item.get('Duration(us)', 0)) for item in items)
+        total_duration = _round(sum(float(item.get('Duration(us)', 0)) for item in items))
         op_count = len(items)
-        time_ratio = (total_duration / model_runtime) if model_runtime > 0 else 0
+        time_ratio = _round((total_duration / model_runtime) if model_runtime > 0 else 0)
 
         type_val = sorted_items[0].get('Type', '')
         is_fa = type_val.startswith('FlashAttention')
-        contribution_mfu = avg_mfu * time_ratio if not is_fa else ''
+        contribution_mfu = _round(avg_mfu * time_ratio) if not is_fa else ''
 
         max_row[new_col_name] = 'max'
         max_row['op_count'] = op_count
         max_row['total_duration(us)'] = total_duration
         max_row['model_runtime(us)'] = model_runtime
-        max_row['time_ratio(%)'] = time_ratio * 100
+        max_row['time_ratio(%)'] = _round(time_ratio)
         new_rows.append(max_row)
 
         min_row[new_col_name] = 'min'
         min_row['op_count'] = op_count
         min_row['total_duration(us)'] = total_duration
         min_row['model_runtime(us)'] = model_runtime
-        min_row['time_ratio(%)'] = time_ratio * 100
+        min_row['time_ratio(%)'] = _round(time_ratio)
         new_rows.append(min_row)
 
         avg_row = create_empty_row(new_headers)
@@ -325,7 +331,7 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
         avg_row['op_count'] = op_count
         avg_row['total_duration(us)'] = total_duration
         avg_row['model_runtime(us)'] = model_runtime
-        avg_row['time_ratio(%)'] = time_ratio * 100
+        avg_row['time_ratio(%)'] = _round(time_ratio)
         avg_row['contribution_to_model_mfu'] = contribution_mfu
         new_rows.append(avg_row)
 

@@ -253,6 +253,43 @@ def infer_recompute_stages(rows: List[Dict[str, Any]]) -> None:
         elif is_matmul_or_grouped(type_val) and (idx >= first_recompute_start or is_weight_grad_like(row)):
             row[RECOMPUTE_STAGE_COL] = PHASE_BACKWARD
 
+    refine_backward_stages_by_shape(rows)
+
+
+def refine_backward_stages_by_shape(rows: List[Dict[str, Any]]) -> None:
+    forward_indices_by_io_key = defaultdict(list)
+    for idx, row in enumerate(rows):
+        if not is_matmul_or_grouped(row.get('Type', '')) or row.get(RECOMPUTE_STAGE_COL) == PHASE_BACKWARD:
+            continue
+
+        io_key = get_matmul_io_key(row)
+        if io_key is not None:
+            forward_indices_by_io_key[io_key].append(idx)
+
+    forward_io_keys = set(forward_indices_by_io_key.keys())
+
+    for idx, row in enumerate(rows):
+        if row.get(RECOMPUTE_STAGE_COL) != PHASE_BACKWARD or not is_weight_grad_like(row):
+            continue
+
+        dw_matches = []
+        for candidate_io_key in forward_io_keys:
+            role = get_backward_role_for_io_key(row, candidate_io_key)
+            if role == 'dw':
+                dw_matches.append(candidate_io_key)
+
+        for io_key in dw_matches:
+            for prev_idx in range(idx - 1, max(-1, idx - 20), -1):
+                prev_row = rows[prev_idx]
+                if not is_matmul_or_grouped(prev_row.get('Type', '')) or is_weight_grad_like(prev_row):
+                    continue
+
+                prev_io_key, prev_role = choose_backward_io_match(prev_row, {io_key})
+                has_earlier_forward = any(forward_idx < prev_idx for forward_idx in forward_indices_by_io_key[io_key])
+                if prev_io_key == io_key and prev_role == 'dx' and has_earlier_forward:
+                    prev_row[RECOMPUTE_STAGE_COL] = PHASE_BACKWARD
+                    break
+
 
 def process_kernel_details(csv_path: Path) -> List[Dict[str, Any]]:
     results = []
@@ -406,6 +443,157 @@ def get_forward_signature(row: Dict[str, Any]) -> Optional[Tuple[str, int, int, 
     return get_matmul_family(type_val), M, K, N
 
 
+def _shape_tuple(shape: List[int]) -> Tuple[int, ...]:
+    return tuple(shape)
+
+
+def get_matmul_io_key(row: Dict[str, Any]) -> Optional[Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]]:
+    type_val = row.get('Type', '')
+    if not is_matmul_or_grouped(type_val):
+        return None
+
+    input_tensors = parse_shape_string(row.get('Input Shapes', ''))
+    output_tensors = parse_shape_string(row.get('Output Shapes', ''))
+    if len(input_tensors) < 2 or not output_tensors:
+        return None
+
+    activation_shape = input_tensors[0]
+    weight_shape = input_tensors[1]
+    output_shape = output_tensors[0]
+    if not activation_shape or not weight_shape or not output_shape:
+        return None
+
+    return (
+        get_matmul_family(type_val),
+        _shape_tuple(activation_shape),
+        _shape_tuple(weight_shape),
+        _shape_tuple(output_shape),
+    )
+
+
+def get_backward_role_for_io_key(row: Dict[str, Any],
+                                 io_key: Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]) -> Optional[str]:
+    role, _ = get_backward_role_and_priority_for_io_key(row, io_key)
+    return role
+
+
+def get_backward_role_and_priority_for_io_key(row: Dict[str, Any],
+                                              io_key: Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]) -> Tuple[Optional[str], int]:
+    type_val = row.get('Type', '')
+    if not is_matmul_or_grouped(type_val):
+        return None, 99
+
+    family, activation_shape, weight_shape, output_shape = io_key
+    if get_matmul_family(type_val) != family:
+        return None, 99
+
+    input_tensors = [_shape_tuple(t) for t in parse_shape_string(row.get('Input Shapes', '')) if t]
+    output_tensors = [_shape_tuple(t) for t in parse_shape_string(row.get('Output Shapes', '')) if t]
+    if not input_tensors or not output_tensors:
+        return None, 99
+
+    grad_output_shape = output_tensors[0]
+    has_forward_output = output_shape in input_tensors
+    has_activation = activation_shape in input_tensors
+    has_weight = weight_shape in input_tensors
+
+    if not is_weight_grad_like(row):
+        if grad_output_shape == activation_shape and has_forward_output and has_weight:
+            return 'dx', 0
+        return None, 99
+
+    if grad_output_shape == weight_shape and has_activation and has_forward_output:
+        return 'dw', 0
+    if family == 'MatMul' and len(weight_shape) == 2 and grad_output_shape == (weight_shape[1], weight_shape[0]) and has_activation and has_forward_output:
+        return 'dw', 1
+    return None, 99
+
+
+def choose_backward_io_match(row: Dict[str, Any],
+                             forward_io_keys: set) -> Tuple[Optional[Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]], Optional[str]]:
+    matches = []
+    for io_key in forward_io_keys:
+        role, priority = get_backward_role_and_priority_for_io_key(row, io_key)
+        if role is not None:
+            matches.append((io_key, role, priority))
+
+    if len(matches) == 1:
+        io_key, role, _ = matches[0]
+        return io_key, role
+    if not matches:
+        return None, None
+
+    role_order = {'dx': 0, 'dw': 1}
+    matches.sort(key=lambda item: (item[2], role_order[item[1]], item[0][0], item[0][1], item[0][2], item[0][3]))
+    io_key, role, _ = matches[0]
+    return io_key, role
+
+
+def describe_io_key(io_key: Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]) -> str:
+    family, activation_shape, weight_shape, output_shape = io_key
+    return f"{family}(A={activation_shape}, W={weight_shape}, Out={output_shape})"
+
+
+def get_first_start_time(items: List[Dict[str, Any]]) -> float:
+    start_values = []
+    for item in items:
+        start_str = str(item.get('Start Time(us)', '')).strip()
+        try:
+            start_values.append(float(start_str))
+        except (ValueError, TypeError):
+            pass
+    return min(start_values) if start_values else 0.0
+
+
+def get_matmul_relationships(group_records: List[Dict[str, Any]]) -> Dict[Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]], Dict[str, Any]]:
+    forward_io_keys = {
+        record['io_key']
+        for record in group_records
+        if record.get('io_key') is not None and record.get('stage') != PHASE_BACKWARD
+    }
+
+    relationships = defaultdict(lambda: {
+        'forward_records': [],
+        'backward_records_by_role': defaultdict(list),
+        'logical_forward_count': 0,
+    })
+
+    for record in group_records:
+        row = record['representative']
+        type_val = row.get('Type', '')
+        if not is_matmul_or_grouped(type_val):
+            continue
+
+        if record['stage'] == PHASE_BACKWARD:
+            io_key, role = choose_backward_io_match(row, forward_io_keys)
+            record['io_key'] = io_key
+            record['backward_role'] = role
+            if io_key is not None and role is not None:
+                relationships[io_key]['backward_records_by_role'][role].append(record)
+        elif record.get('io_key') is not None:
+            io_key = record['io_key']
+            relationships[io_key]['forward_records'].append(record)
+            relationships[io_key]['logical_forward_count'] += record.get('phase_counts', {}).get(PHASE_FORWARD, 0)
+
+    for relation in relationships.values():
+        relation['forward_records'].sort(key=lambda r: r['first_start'])
+        for role_records in relation['backward_records_by_role'].values():
+            role_records.sort(key=lambda r: r['first_start'])
+
+        dx_records = relation['backward_records_by_role'].get('dx', [])
+        dw_records = relation['backward_records_by_role'].get('dw', [])
+        logical_forward_count = relation['logical_forward_count']
+        relation['is_complete'] = (
+            bool(relation['forward_records']) and
+            len(dx_records) == 1 and
+            len(dw_records) == 1 and
+            dx_records[0]['op_count'] == logical_forward_count and
+            dw_records[0]['op_count'] == logical_forward_count
+        )
+
+    return relationships
+
+
 def get_backward_parent_candidates(row: Dict[str, Any]) -> List[Tuple[str, int, int, int]]:
     type_val = row.get('Type', '')
     if not is_matmul_or_grouped(type_val):
@@ -456,31 +644,11 @@ def choose_backward_parent_signature(row: Dict[str, Any],
 
 
 def order_statistics_group_records(group_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    forward_signatures = {
-        record['forward_signature']
-        for record in group_records
-        if record.get('forward_signature') is not None
-    }
-
-    forward_by_signature = defaultdict(list)
-    backward_by_signature = defaultdict(list)
-
-    for record in group_records:
-        row = record['representative']
-        type_val = row.get('Type', '')
-        if not is_matmul_or_grouped(type_val):
-            continue
-
-        if record['stage'] == PHASE_BACKWARD:
-            parent_signature = choose_backward_parent_signature(row, forward_signatures)
-            record['parent_signature'] = parent_signature
-            if parent_signature is not None:
-                backward_by_signature[parent_signature].append(record)
-        elif record.get('forward_signature') is not None:
-            forward_by_signature[record['forward_signature']].append(record)
-
+    relationships = get_matmul_relationships(group_records)
     ordered_records = []
+    incomplete_matmul_records = []
     emitted_ids = set()
+    emitted_complete_io_keys = set()
 
     for record in group_records:
         record_id = id(record)
@@ -489,34 +657,51 @@ def order_statistics_group_records(group_records: List[Dict[str, Any]]) -> List[
 
         row = record['representative']
         type_val = row.get('Type', '')
-        if is_matmul_or_grouped(type_val) and record['stage'] != PHASE_BACKWARD and record.get('forward_signature') is not None:
-            signature = record['forward_signature']
-            for related_record in forward_by_signature.get(signature, []):
-                related_id = id(related_record)
-                if related_id not in emitted_ids:
-                    ordered_records.append(related_record)
-                    emitted_ids.add(related_id)
-            for related_record in backward_by_signature.get(signature, []):
-                related_id = id(related_record)
-                if related_id not in emitted_ids:
-                    ordered_records.append(related_record)
-                    emitted_ids.add(related_id)
-        elif is_matmul_or_grouped(type_val) and record['stage'] == PHASE_BACKWARD and record.get('parent_signature') in forward_signatures:
-            continue
-        else:
+        if not is_matmul_or_grouped(type_val):
             ordered_records.append(record)
             emitted_ids.add(record_id)
+            continue
+
+        io_key = record.get('io_key')
+        relation = relationships.get(io_key) if io_key is not None else None
+        if relation is not None and relation.get('is_complete'):
+            if io_key in emitted_complete_io_keys:
+                continue
+
+            complete_records = (
+                relation['forward_records'] +
+                relation['backward_records_by_role']['dx'] +
+                relation['backward_records_by_role']['dw']
+            )
+            for related_record in complete_records:
+                related_id = id(related_record)
+                if related_id not in emitted_ids:
+                    ordered_records.append(related_record)
+                    emitted_ids.add(related_id)
+            emitted_complete_io_keys.add(io_key)
+            continue
+
+        incomplete_matmul_records.append(record)
+        emitted_ids.add(record_id)
 
     for record in group_records:
         if id(record) not in emitted_ids:
-            ordered_records.append(record)
+            row = record['representative']
+            if is_matmul_or_grouped(row.get('Type', '')):
+                incomplete_matmul_records.append(record)
+            else:
+                ordered_records.append(record)
+            emitted_ids.add(id(record))
+
+    ordered_records.extend(incomplete_matmul_records)
 
     return ordered_records
 
 
 def validate_matmul_backward_counts(all_results: List[Dict[str, Any]]) -> List[str]:
     forward_counts = defaultdict(int)
-    backward_counts = defaultdict(int)
+    recompute_counts = defaultdict(int)
+    backward_counts = defaultdict(lambda: defaultdict(int))
 
     for row in all_results:
         type_val = row.get('Type', '')
@@ -524,39 +709,41 @@ def validate_matmul_backward_counts(all_results: List[Dict[str, Any]]) -> List[s
             continue
 
         phase = row.get(RECOMPUTE_STAGE_COL, PHASE_FORWARD)
-        if phase != PHASE_FORWARD:
+        if phase == PHASE_BACKWARD:
             continue
 
-        signature = get_forward_signature(row)
-        if signature is None:
+        io_key = get_matmul_io_key(row)
+        if io_key is None:
             continue
 
-        forward_counts[signature] += 1
+        if phase == PHASE_RECOMPUTE:
+            recompute_counts[io_key] += 1
+        else:
+            forward_counts[io_key] += 1
 
-    forward_signatures = set(forward_counts.keys())
+    forward_io_keys = set(forward_counts.keys()) | set(recompute_counts.keys())
 
     for row in all_results:
         type_val = row.get('Type', '')
         if not is_matmul_or_grouped(type_val) or row.get(RECOMPUTE_STAGE_COL) != PHASE_BACKWARD:
             continue
 
-        parent_signature = choose_backward_parent_signature(row, forward_signatures)
-        if parent_signature is not None:
-            backward_counts[parent_signature] += 1
+        io_key, role = choose_backward_io_match(row, forward_io_keys)
+        if io_key is not None and role is not None:
+            backward_counts[io_key][role] += 1
 
     warnings = []
-    for signature in sorted(forward_signatures):
-        backward_count = backward_counts.get(signature, 0)
-        if backward_count == 0:
+    for io_key in sorted(forward_io_keys):
+        forward_count = forward_counts.get(io_key, 0)
+        if forward_count == 0:
             continue
 
-        logical_forward_count = forward_counts[signature]
-        expected_backward_count = logical_forward_count * 2
-        if backward_count != expected_backward_count:
-            family, M, K, N = signature
+        dx_count = backward_counts[io_key].get('dx', 0)
+        dw_count = backward_counts[io_key].get('dw', 0)
+        if dx_count != forward_count or dw_count != forward_count:
             warnings.append(
-                f"{family}(M={M},K={K},N={N}) forward={logical_forward_count:g}, "
-                f"backward={backward_count}, expected_backward={expected_backward_count:g}"
+                f"{describe_io_key(io_key)} forward={forward_count:g}, recompute={recompute_counts.get(io_key, 0):g}, "
+                f"dx={dx_count:g}, dw={dw_count:g}, expected_dx=expected_dw={forward_count:g}"
             )
 
     return warnings
@@ -616,6 +803,9 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
         total_duration = _round(sum(float(item.get('Duration(us)', 0)) for item in items))
         op_count = len(items)
         time_ratio = _round((total_duration / model_runtime) if model_runtime > 0 else 0)
+        phase_counts = defaultdict(int)
+        for item in items:
+            phase_counts[item.get(RECOMPUTE_STAGE_COL, PHASE_FORWARD)] += 1
 
         type_val = sorted_items[0].get('Type', '')
         is_fa = type_val.startswith('FlashAttention')
@@ -662,18 +852,36 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
             'representative': representative_row,
             'stage': group_stage,
             'forward_signature': get_forward_signature(representative_row),
+            'io_key': get_matmul_io_key(representative_row),
+            'phase_counts': dict(phase_counts),
+            'op_count': op_count,
+            'first_start': get_first_start_time(items),
         })
 
+    ordered_group_records = order_statistics_group_records(group_records)
+    complete_io_keys = {
+        io_key for io_key, relation in get_matmul_relationships(group_records).items()
+        if relation.get('is_complete')
+    }
+
     is_first_group = True
-    for group_record in order_statistics_group_records(group_records):
+    previous_group_record = None
+    for group_record in ordered_group_records:
         if is_first_group:
             empty_rows = [create_empty_row(new_headers) for _ in range(10)]
             new_rows.extend(empty_rows)
             is_first_group = False
         else:
-            empty_rows = [create_empty_row(new_headers) for _ in range(2)]
-            new_rows.extend(empty_rows)
+            same_complete_matmul = (
+                previous_group_record is not None and
+                group_record.get('io_key') == previous_group_record.get('io_key') and
+                group_record.get('io_key') in complete_io_keys
+            )
+            if not same_complete_matmul:
+                empty_rows = [create_empty_row(new_headers) for _ in range(2)]
+                new_rows.extend(empty_rows)
         new_rows.extend(group_record['rows'])
+        previous_group_record = group_record
 
     for col in ['op_count', 'total_duration(us)', 'model_runtime(us)', 'time_ratio(%)']:
         if col not in new_headers:
@@ -753,11 +961,17 @@ def main():
     stat_rows, new_headers = compute_statistics(all_results, original_headers, model_runtime)
 
     all_rows = all_results + stat_rows
+    output_rows = []
+    for row in all_rows:
+        output_row = dict(row)
+        if output_row.get('stat_type') != 'ave':
+            output_row[RECOMPUTE_STAGE_COL] = ''
+        output_rows.append(output_row)
 
     with open(output_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=new_headers, extrasaction='ignore')
         writer.writeheader()
-        writer.writerows(all_rows)
+        writer.writerows(output_rows)
 
     print(f"\nResults written to: {output_file}")
     print(f"Total records: {len(all_results)}")

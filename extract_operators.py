@@ -584,7 +584,7 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
     headers = [h for h in headers if h != RECOMPUTE_STAGE_COL]
 
     if 'source_path' in headers:
-        source_idx = headers.index('source_path')
+        source_idx = headers.index('MFU')
         new_headers = headers[:source_idx] + [new_col_name] + headers[source_idx:]
     else:
         new_headers = [new_col_name] + headers
@@ -624,7 +624,7 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
             any(item.get(RECOMPUTE_STAGE_COL) == PHASE_RECOMPUTE for item in items)
         )
         effective_time_ratio = time_ratio / 2 if is_recomputed_matmul else time_ratio
-        contribution_mfu = _round(avg_mfu * effective_time_ratio) if not is_fa else ''
+        contribution_mfu = _round(avg_mfu * effective_time_ratio) #if not is_fa else ''
         if any(item.get(RECOMPUTE_STAGE_COL) == PHASE_RECOMPUTE for item in items):
             group_stage = PHASE_RECOMPUTE
         elif any(item.get(RECOMPUTE_STAGE_COL) == PHASE_BACKWARD for item in items):
@@ -633,18 +633,18 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
             group_stage = PHASE_FORWARD
 
         max_row[new_col_name] = 'max'
-        max_row[RECOMPUTE_STAGE_COL] = group_stage
-        max_row['op_count'] = op_count
-        max_row['total_duration(us)'] = total_duration
-        max_row['model_runtime(us)'] = model_runtime
-        max_row['time_ratio(%)'] = _round(time_ratio)
+        # max_row[RECOMPUTE_STAGE_COL] = group_stage
+        # max_row['op_count'] = op_count
+        # max_row['total_duration(us)'] = total_duration
+        # max_row['model_runtime(us)'] = model_runtime
+        # max_row['time_ratio(%)'] = _round(time_ratio)
 
         min_row[new_col_name] = 'min'
-        min_row[RECOMPUTE_STAGE_COL] = group_stage
-        min_row['op_count'] = op_count
-        min_row['total_duration(us)'] = total_duration
-        min_row['model_runtime(us)'] = model_runtime
-        min_row['time_ratio(%)'] = _round(time_ratio)
+        # min_row[RECOMPUTE_STAGE_COL] = group_stage
+        # min_row['op_count'] = op_count
+        # min_row['total_duration(us)'] = total_duration
+        # min_row['model_runtime(us)'] = model_runtime
+        # min_row['time_ratio(%)'] = _round(time_ratio)
 
         avg_row = create_empty_row(new_headers)
         avg_row[new_col_name] = 'ave'

@@ -7,9 +7,9 @@ from collections import defaultdict
 import statistics
 
 RECOMPUTE_STAGE_COL = 'recompute_stage'
-PHASE_FORWARD = '前向'
-PHASE_RECOMPUTE = '重计算'
-PHASE_BACKWARD = '反向'
+PHASE_FORWARD = 'forward'
+PHASE_RECOMPUTE = 'recompute'
+PHASE_BACKWARD = 'backward'
 
 
 def parse_shape_string(shape_str: str) -> List[List[int]]:

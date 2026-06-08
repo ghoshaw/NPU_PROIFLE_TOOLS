@@ -202,6 +202,8 @@ def infer_recompute_stages(rows: List[Dict[str, Any]]) -> None:
                 type_val = rows[idx].get('Type', '')
                 if is_matmul_or_grouped(type_val) or type_val == 'FlashAttentionScoreGrad':
                     rows[idx][RECOMPUTE_STAGE_COL] = PHASE_BACKWARD
+            refine_backward_stages_by_shape(rows)
+            classify_matmul_recompute_by_backward_counts(rows)
         return
 
     first_recompute_anchor = min(recompute_anchor_indices)
@@ -254,6 +256,7 @@ def infer_recompute_stages(rows: List[Dict[str, Any]]) -> None:
             row[RECOMPUTE_STAGE_COL] = PHASE_BACKWARD
 
     refine_backward_stages_by_shape(rows)
+    classify_matmul_recompute_by_backward_counts(rows)
 
 
 def refine_backward_stages_by_shape(rows: List[Dict[str, Any]]) -> None:
@@ -279,9 +282,11 @@ def refine_backward_stages_by_shape(rows: List[Dict[str, Any]]) -> None:
                 dw_matches.append(candidate_io_key)
 
         for io_key in dw_matches:
-            for prev_idx in range(idx - 1, max(-1, idx - 20), -1):
+            for prev_idx in range(idx - 1, -1, -1):
                 prev_row = rows[prev_idx]
-                if not is_matmul_or_grouped(prev_row.get('Type', '')) or is_weight_grad_like(prev_row):
+                if (not is_matmul_or_grouped(prev_row.get('Type', '')) or
+                        prev_row.get(RECOMPUTE_STAGE_COL) == PHASE_BACKWARD or
+                        is_weight_grad_like(prev_row)):
                     continue
 
                 prev_io_key, prev_role = choose_backward_io_match(prev_row, {io_key})
@@ -289,6 +294,64 @@ def refine_backward_stages_by_shape(rows: List[Dict[str, Any]]) -> None:
                 if prev_io_key == io_key and prev_role == 'dx' and has_earlier_forward:
                     prev_row[RECOMPUTE_STAGE_COL] = PHASE_BACKWARD
                     break
+
+
+def classify_matmul_recompute_by_backward_counts(rows: List[Dict[str, Any]]) -> None:
+    candidate_forward_keys = set()
+    for row in rows:
+        if (not is_matmul_or_grouped(row.get('Type', '')) or
+                row.get(RECOMPUTE_STAGE_COL) == PHASE_BACKWARD or
+                is_weight_grad_like(row)):
+            continue
+
+        io_key = get_matmul_io_key(row)
+        if io_key is not None:
+            candidate_forward_keys.add(io_key)
+
+    if not candidate_forward_keys:
+        return
+
+    backward_counts = defaultdict(lambda: defaultdict(int))
+    matched_backward_indices = set()
+    for idx, row in enumerate(rows):
+        if not is_matmul_or_grouped(row.get('Type', '')) or row.get(RECOMPUTE_STAGE_COL) != PHASE_BACKWARD:
+            continue
+
+        io_key, role = choose_backward_io_match(row, candidate_forward_keys)
+        if io_key is None or role is None:
+            continue
+
+        backward_counts[io_key][role] += 1
+        matched_backward_indices.add(idx)
+
+    forward_like_indices = defaultdict(list)
+    for idx, row in enumerate(rows):
+        if idx in matched_backward_indices:
+            continue
+        if (not is_matmul_or_grouped(row.get('Type', '')) or
+                row.get(RECOMPUTE_STAGE_COL) == PHASE_BACKWARD or
+                is_weight_grad_like(row)):
+            continue
+
+        io_key = get_matmul_io_key(row)
+        if io_key is not None:
+            forward_like_indices[io_key].append(idx)
+
+    for io_key, indices in forward_like_indices.items():
+        dx_count = backward_counts[io_key].get('dx', 0)
+        dw_count = backward_counts[io_key].get('dw', 0)
+        if dx_count == 0 or dw_count == 0:
+            continue
+
+        logical_forward_count = min(dx_count, dw_count)
+        if len(indices) <= logical_forward_count:
+            continue
+
+        for idx in indices[:logical_forward_count]:
+            if rows[idx].get(RECOMPUTE_STAGE_COL) != PHASE_BACKWARD:
+                rows[idx][RECOMPUTE_STAGE_COL] = PHASE_FORWARD
+        for idx in indices[logical_forward_count:]:
+            rows[idx][RECOMPUTE_STAGE_COL] = PHASE_RECOMPUTE
 
 
 def process_kernel_details(csv_path: Path) -> List[Dict[str, Any]]:
@@ -408,8 +471,9 @@ def get_group_key(row: Dict[str, Any]) -> str:
 
 def get_statistics_group_key(row: Dict[str, Any]) -> str:
     phase = row.get(RECOMPUTE_STAGE_COL, PHASE_FORWARD)
-    phase_bucket = PHASE_BACKWARD if phase == PHASE_BACKWARD else 'forward_recompute'
-    return f"{get_group_key(row)}|{phase_bucket}"
+    if phase not in {PHASE_FORWARD, PHASE_RECOMPUTE, PHASE_BACKWARD}:
+        phase = PHASE_FORWARD
+    return f"{get_group_key(row)}|{phase}"
 
 
 def get_matmul_family(type_val: str) -> str:
@@ -549,11 +613,12 @@ def get_matmul_relationships(group_records: List[Dict[str, Any]]) -> Dict[Tuple[
     forward_io_keys = {
         record['io_key']
         for record in group_records
-        if record.get('io_key') is not None and record.get('stage') != PHASE_BACKWARD
+        if record.get('io_key') is not None and record.get('stage') == PHASE_FORWARD
     }
 
     relationships = defaultdict(lambda: {
         'forward_records': [],
+        'recompute_records': [],
         'backward_records_by_role': defaultdict(list),
         'logical_forward_count': 0,
     })
@@ -564,19 +629,23 @@ def get_matmul_relationships(group_records: List[Dict[str, Any]]) -> Dict[Tuple[
         if not is_matmul_or_grouped(type_val):
             continue
 
+        record['backward_role'] = None
         if record['stage'] == PHASE_BACKWARD:
             io_key, role = choose_backward_io_match(row, forward_io_keys)
             record['io_key'] = io_key
             record['backward_role'] = role
             if io_key is not None and role is not None:
                 relationships[io_key]['backward_records_by_role'][role].append(record)
-        elif record.get('io_key') is not None:
+        elif record['stage'] == PHASE_FORWARD and record.get('io_key') is not None:
             io_key = record['io_key']
             relationships[io_key]['forward_records'].append(record)
             relationships[io_key]['logical_forward_count'] += record.get('phase_counts', {}).get(PHASE_FORWARD, 0)
+        elif record['stage'] == PHASE_RECOMPUTE and record.get('io_key') is not None:
+            relationships[record['io_key']]['recompute_records'].append(record)
 
     for relation in relationships.values():
         relation['forward_records'].sort(key=lambda r: r['first_start'])
+        relation['recompute_records'].sort(key=lambda r: r['first_start'])
         for role_records in relation['backward_records_by_role'].values():
             role_records.sort(key=lambda r: r['first_start'])
 
@@ -592,6 +661,15 @@ def get_matmul_relationships(group_records: List[Dict[str, Any]]) -> Dict[Tuple[
         )
 
     return relationships
+
+
+def is_complete_matmul_stat_record(record: Dict[str, Any], complete_io_keys: set) -> bool:
+    io_key = record.get('io_key')
+    if io_key not in complete_io_keys:
+        return False
+    if record.get('stage') == PHASE_FORWARD:
+        return True
+    return record.get('stage') == PHASE_BACKWARD and record.get('backward_role') in {'dx', 'dw'}
 
 
 def get_backward_parent_candidates(row: Dict[str, Any]) -> List[Tuple[str, int, int, int]]:
@@ -649,8 +727,23 @@ def order_statistics_group_records(group_records: List[Dict[str, Any]]) -> List[
     incomplete_matmul_records = []
     emitted_ids = set()
     emitted_complete_io_keys = set()
+    sorted_records = sorted(group_records, key=lambda r: (r['first_start'], r['key']))
 
-    for record in group_records:
+    def emit_complete_matmul(io_key: Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]) -> None:
+        relation = relationships[io_key]
+        complete_records = (
+            relation['forward_records'] +
+            relation['backward_records_by_role']['dx'] +
+            relation['backward_records_by_role']['dw']
+        )
+        for related_record in complete_records:
+            related_id = id(related_record)
+            if related_id not in emitted_ids:
+                ordered_records.append(related_record)
+                emitted_ids.add(related_id)
+        emitted_complete_io_keys.add(io_key)
+
+    for record in sorted_records:
         record_id = id(record)
         if record_id in emitted_ids:
             continue
@@ -662,36 +755,40 @@ def order_statistics_group_records(group_records: List[Dict[str, Any]]) -> List[
             emitted_ids.add(record_id)
             continue
 
+        if record.get('stage') == PHASE_RECOMPUTE:
+            ordered_records.append(record)
+            emitted_ids.add(record_id)
+            continue
+
         io_key = record.get('io_key')
         relation = relationships.get(io_key) if io_key is not None else None
         if relation is not None and relation.get('is_complete'):
-            if io_key in emitted_complete_io_keys:
-                continue
-
-            complete_records = (
-                relation['forward_records'] +
-                relation['backward_records_by_role']['dx'] +
-                relation['backward_records_by_role']['dw']
-            )
-            for related_record in complete_records:
-                related_id = id(related_record)
-                if related_id not in emitted_ids:
-                    ordered_records.append(related_record)
-                    emitted_ids.add(related_id)
-            emitted_complete_io_keys.add(io_key)
+            if io_key not in emitted_complete_io_keys and record.get('stage') == PHASE_FORWARD:
+                emit_complete_matmul(io_key)
             continue
 
         incomplete_matmul_records.append(record)
         emitted_ids.add(record_id)
 
-    for record in group_records:
+    for record in sorted_records:
         if id(record) not in emitted_ids:
             row = record['representative']
             if is_matmul_or_grouped(row.get('Type', '')):
-                incomplete_matmul_records.append(record)
+                if record.get('stage') == PHASE_RECOMPUTE:
+                    ordered_records.append(record)
+                    emitted_ids.add(id(record))
+                    continue
+
+                io_key = record.get('io_key')
+                relation = relationships.get(io_key) if io_key is not None else None
+                if relation is not None and relation.get('is_complete') and io_key not in emitted_complete_io_keys:
+                    emit_complete_matmul(io_key)
+                elif id(record) not in emitted_ids:
+                    incomplete_matmul_records.append(record)
+                    emitted_ids.add(id(record))
             else:
                 ordered_records.append(record)
-            emitted_ids.add(id(record))
+                emitted_ids.add(id(record))
 
     ordered_records.extend(incomplete_matmul_records)
 
@@ -721,7 +818,7 @@ def validate_matmul_backward_counts(all_results: List[Dict[str, Any]]) -> List[s
         else:
             forward_counts[io_key] += 1
 
-    forward_io_keys = set(forward_counts.keys()) | set(recompute_counts.keys())
+    forward_io_keys = set(forward_counts.keys())
 
     for row in all_results:
         type_val = row.get('Type', '')
@@ -777,7 +874,8 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
         new_headers = [new_col_name] + headers
 
     group_records = []
-    for key, items in sorted(groups.items()):
+    sorted_groups = sorted(groups.items(), key=lambda item: (get_first_start_time(item[1]), item[0]))
+    for key, items in sorted_groups:
         valid_items = []
         for item in items:
             mfu_str = item.get('MFU', '')
@@ -807,14 +905,7 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
         for item in items:
             phase_counts[item.get(RECOMPUTE_STAGE_COL, PHASE_FORWARD)] += 1
 
-        type_val = sorted_items[0].get('Type', '')
-        is_fa = type_val.startswith('FlashAttention')
-        is_recomputed_matmul = (
-            (type_val.startswith('MatMul') or type_val.startswith('GroupedMatmul')) and
-            any(item.get(RECOMPUTE_STAGE_COL) == PHASE_RECOMPUTE for item in items)
-        )
-        effective_time_ratio = time_ratio / 2 if is_recomputed_matmul else time_ratio
-        contribution_mfu = _round(avg_mfu * effective_time_ratio) #if not is_fa else ''
+        contribution_value = _round(avg_mfu * time_ratio)
         if any(item.get(RECOMPUTE_STAGE_COL) == PHASE_RECOMPUTE for item in items):
             group_stage = PHASE_RECOMPUTE
         elif any(item.get(RECOMPUTE_STAGE_COL) == PHASE_BACKWARD for item in items):
@@ -844,7 +935,10 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
         avg_row['total_duration(us)'] = total_duration
         avg_row['model_runtime(us)'] = model_runtime
         avg_row['time_ratio(%)'] = _round(time_ratio)
-        avg_row['contribution_to_model_mfu'] = contribution_mfu
+        if group_stage == PHASE_RECOMPUTE:
+            avg_row['contribution_to_model_hfu'] = contribution_value
+        else:
+            avg_row['contribution_to_model_mfu'] = contribution_value
 
         group_records.append({
             'key': key,
@@ -875,7 +969,8 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
             same_complete_matmul = (
                 previous_group_record is not None and
                 group_record.get('io_key') == previous_group_record.get('io_key') and
-                group_record.get('io_key') in complete_io_keys
+                is_complete_matmul_stat_record(previous_group_record, complete_io_keys) and
+                is_complete_matmul_stat_record(group_record, complete_io_keys)
             )
             if not same_complete_matmul:
                 empty_rows = [create_empty_row(new_headers) for _ in range(2)]
@@ -898,9 +993,11 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
         else:
             new_headers.append(RECOMPUTE_STAGE_COL)
 
-    if 'contribution_to_model_mfu' not in new_headers:
+    contribution_cols = ['contribution_to_model_mfu', 'contribution_to_model_hfu']
+    missing_contribution_cols = [col for col in contribution_cols if col not in new_headers]
+    if missing_contribution_cols:
         stage_idx = new_headers.index(RECOMPUTE_STAGE_COL)
-        new_headers = new_headers[:stage_idx+1] + ['contribution_to_model_mfu'] + new_headers[stage_idx+1:]
+        new_headers = new_headers[:stage_idx+1] + missing_contribution_cols + new_headers[stage_idx+1:]
 
     stat_output_cols = [
         'op_count',
@@ -909,6 +1006,7 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
         'time_ratio(%)',
         RECOMPUTE_STAGE_COL,
         'contribution_to_model_mfu',
+        'contribution_to_model_hfu',
     ]
     new_headers = [h for h in new_headers if h not in stat_output_cols]
     if 'MFU' in new_headers:

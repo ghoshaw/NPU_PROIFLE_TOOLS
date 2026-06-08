@@ -1,3 +1,4 @@
+import argparse
 import os
 import csv
 import re
@@ -10,6 +11,54 @@ RECOMPUTE_STAGE_COL = 'recompute_stage'
 PHASE_FORWARD = 'forward'
 PHASE_RECOMPUTE = 'recompute'
 PHASE_BACKWARD = 'backward'
+
+STATISTICS_OUTPUT_HEADERS = [
+    'Name',
+    'Type',
+    'Duration(us)',
+    'Input Shapes',
+    'Output Shapes',
+    'M',
+    'K',
+    'N',
+    'B',
+    'N_heads',
+    'S_q',
+    'S_k',
+    'D',
+    'FLOPs',
+    'stat_type',
+    'MFU',
+    'op_count',
+    'total_duration(us)',
+    'model_runtime(us)',
+    'time_ratio(%)',
+    RECOMPUTE_STAGE_COL,
+    'contribution_to_model_mfu',
+    'contribution_to_model_hfu',
+    'MBU',
+    'I',
+    'AI',
+    'source_path',
+]
+
+STATISTICS_AVERAGE_REPRESENTATIVE_COLS = [
+    'Name',
+    'Type',
+    'Input Shapes',
+    'Output Shapes',
+    'M',
+    'K',
+    'N',
+    'B',
+    'N_heads',
+    'S_q',
+    'S_k',
+    'D',
+    'FLOPs',
+    'I',
+    'AI',
+]
 
 
 def parse_shape_string(shape_str: str) -> List[List[int]]:
@@ -74,27 +123,38 @@ def extract_matmul_dims(input_shapes: str, output_shapes: str, is_grouped: bool 
     return None, None, None
 
 
-def extract_fa_dims(input_shapes: str) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
+def extract_fa_dims(input_shapes: str,
+                    mbs: int = 1,
+                    seqlen: int = 1) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
     input_tensors = parse_shape_string(input_shapes)
 
     if not input_tensors:
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
     first_tensor = input_tensors[0]
 
     if len(first_tensor) == 4:
         B, N, S, D = first_tensor[0], first_tensor[1], first_tensor[2], first_tensor[3]
         S_key = input_tensors[1][2] if len(input_tensors) > 1 and len(input_tensors[1]) > 2 else S
-        return B, N, S, D, S_key
+        return B, N, S, D, S_key, 1
     elif len(first_tensor) == 3:
-        return 1, first_tensor[1], first_tensor[0], first_tensor[2], first_tensor[0]
+        T, N, D = first_tensor[0], first_tensor[1], first_tensor[2]
+        divisor = mbs * seqlen
+        if T % divisor != 0:
+            raise ValueError(
+                f"3D FA shape requires T divisible by mbs*seqlen, got input_shapes={input_shapes}, "
+                f"T={T}, mbs={mbs}, seqlen={seqlen}"
+            )
+        seqs = T // divisor
+        return mbs, N, seqlen, D, seqlen, seqs
 
-    return None, None, None, None, None
+    return None, None, None, None, None, None
 
 
 def calculate_flops_mfu(M: Optional[int], K: Optional[int], N: Optional[int],
                         B: Optional[int], S: Optional[int], S_key: Optional[int], D: Optional[int],
-                        op_type: str, duration_us: float) -> Tuple[Optional[float], Optional[float]]:
+                        op_type: str, duration_us: float,
+                        fa_seq_count: Optional[int] = 1) -> Tuple[Optional[float], Optional[float]]:
     if duration_us <= 0:
         return None, None
 
@@ -104,13 +164,15 @@ def calculate_flops_mfu(M: Optional[int], K: Optional[int], N: Optional[int],
         if M is not None and K is not None and N is not None:
             flops = 2.0 * M * N * K
     elif op_type == 'FlashAttentionScore':
-        if B is not None and S is not None and D is not None:
+        if B is not None and S is not None and S_key is not None and D is not None:
             N_val = N if N is not None else 1
-            flops = 4.0 * B * S * S_key * N_val * D
+            seq_count = fa_seq_count if fa_seq_count is not None else 1
+            flops = 4.0 * B * S * S_key * N_val * D * seq_count
     elif op_type == 'FlashAttentionScoreGrad':
-        if B is not None and S is not None and D is not None:
+        if B is not None and S is not None and S_key is not None and D is not None:
             N_val = N if N is not None else 1
-            flops = 4.0 * B * S * S_key * N_val * D * 2.5
+            seq_count = fa_seq_count if fa_seq_count is not None else 1
+            flops = 4.0 * B * S * S_key * N_val * D * seq_count * 2.5
 
     if flops is not None:
         mfu = flops / (432.0 * duration_us * 1_000_000.0)
@@ -354,7 +416,7 @@ def classify_matmul_recompute_by_backward_counts(rows: List[Dict[str, Any]]) -> 
             rows[idx][RECOMPUTE_STAGE_COL] = PHASE_RECOMPUTE
 
 
-def process_kernel_details(csv_path: Path) -> List[Dict[str, Any]]:
+def process_kernel_details(csv_path: Path, mbs: int = 1, seqlen: int = 1) -> List[Dict[str, Any]]:
     results = []
 
     with open(csv_path, 'r', encoding='utf-8') as f:
@@ -395,8 +457,13 @@ def process_kernel_details(csv_path: Path) -> List[Dict[str, Any]]:
                 flops_bw, mbu = calculate_flops_mbu(M, K, N, None, None, None, None, type_val, duration_us)
                 I = flops / flops_bw
             elif is_fa or is_fa_grad:
-                B, N_head, S, D, S_key = extract_fa_dims(input_shapes)
-                flops, mfu = calculate_flops_mfu(None, None, N_head, B, S, S_key, D, type_val, duration_us)
+                try:
+                    B, N_head, S, D, S_key, fa_seq_count = extract_fa_dims(input_shapes, mbs, seqlen)
+                except ValueError as e:
+                    raise ValueError(f"{e}; source={csv_path}") from e
+                flops, mfu = calculate_flops_mfu(
+                    None, None, N_head, B, S, S_key, D, type_val, duration_us, fa_seq_count
+                )
 
             result_row = dict(row)
             result_row['M'] = M if M is not None else ''
@@ -432,26 +499,23 @@ def find_ascend_pt_folders(base_dir: Path) -> List[Path]:
     return folders
 
 
-def get_model_runtime(base_dir: Path) -> float:
+def get_model_runtime(csv_files: List[Path]) -> float:
     stage_values = []
-    for item in base_dir.iterdir():
-        if item.is_dir() and item.name.endswith('_ascend_pt'):
-            profiler_output = item / 'ASCEND_PROFILER_OUTPUT'
-            if profiler_output.exists():
-                step_trace_file = profiler_output / 'step_trace_time.csv'
-                if step_trace_file.exists():
-                    try:
-                        with open(step_trace_file, 'r', encoding='utf-8') as f:
-                            reader = csv.DictReader(f)
-                            for row in reader:
-                                stage_str = row.get('Stage', '')
-                                if stage_str:
-                                    try:
-                                        stage_values.append(float(stage_str))
-                                    except (ValueError, TypeError):
-                                        pass
-                    except Exception as e:
-                        print(f"Error reading {step_trace_file}: {e}")
+    for csv_file in csv_files:
+        step_trace_file = csv_file.parent / 'step_trace_time.csv'
+        if step_trace_file.exists():
+            try:
+                with open(step_trace_file, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        stage_str = row.get('Stage', '')
+                        if stage_str:
+                            try:
+                                stage_values.append(float(stage_str))
+                            except (ValueError, TypeError):
+                                pass
+            except Exception as e:
+                print(f"Error reading {step_trace_file}: {e}")
 
     if stage_values:
         return sum(stage_values)
@@ -489,6 +553,15 @@ def _to_int(value: Any) -> Optional[int]:
         return None
     try:
         return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _to_float(value: Any) -> Optional[float]:
+    if value == '':
+        return None
+    try:
+        return float(value)
     except (ValueError, TypeError):
         return None
 
@@ -853,8 +926,98 @@ def create_empty_row(headers: List[str]) -> Dict[str, str]:
 def _round(v):
     """保留4位小数"""
     if isinstance(v, (int, float)) and v != '':
-        return round(v, 4)
+        return round(v, 8)
     return v
+
+
+def parse_args() -> Tuple[Path, int, int, int]:
+    parser = argparse.ArgumentParser(
+        description='Extract MM/GMM/FA operators and shape-level statistics from Ascend profiler output.'
+    )
+    parser.add_argument(
+        'profile_dir',
+        nargs='?',
+        default=r'd:\workfiles\profiles\npu_profiling_ep8cp2_93x480p',
+        help='Profile directory that contains *_ascend_pt folders.',
+    )
+    parser.add_argument(
+        'positional_num',
+        nargs='?',
+        type=int,
+        help='Number of *_ascend_pt folders to include.',
+    )
+    parser.add_argument(
+        '--num',
+        dest='named_num',
+        type=int,
+        help='Number of *_ascend_pt folders to include.',
+    )
+    parser.add_argument(
+        '--mbs',
+        type=int,
+        default=1,
+        help='Micro batch size used for 3D FlashAttention shape inference.',
+    )
+    parser.add_argument(
+        '--seqlen',
+        type=int,
+        default=1,
+        help='Sequence length used for 3D FlashAttention shape inference.',
+    )
+    args = parser.parse_args()
+
+    if args.positional_num is not None and args.named_num is not None and args.positional_num != args.named_num:
+        parser.error('positional num and --num must match when both are provided')
+
+    num = args.named_num if args.named_num is not None else args.positional_num
+    if num is None:
+        num = 1
+    if num < 1:
+        parser.error('num must be a positive integer')
+    if args.mbs < 1:
+        parser.error('mbs must be a positive integer')
+    if args.seqlen < 1:
+        parser.error('seqlen must be a positive integer')
+
+    return Path(args.profile_dir), num, args.mbs, args.seqlen
+
+
+def build_operator_output(all_results: List[Dict[str, Any]],
+                          original_headers: List[str],
+                          model_runtime: float) -> Tuple[List[Dict[str, Any]], List[str]]:
+    metric_cols = [
+        'model_runtime(us)',
+        'time_ratio(%)',
+        RECOMPUTE_STAGE_COL,
+        'contribution_to_model_mfu',
+        'contribution_to_model_hfu',
+    ]
+    excluded_cols = set(metric_cols + ['stat_type'])
+    output_headers = [h for h in original_headers if h not in excluded_cols] + metric_cols
+
+    output_rows = []
+    for row in all_results:
+        output_row = dict(row)
+        phase = row.get(RECOMPUTE_STAGE_COL, PHASE_FORWARD)
+        duration_us = _to_float(row.get('Duration(us)', '')) or 0.0
+        time_ratio = _round((duration_us / model_runtime) if model_runtime > 0 else 0)
+        mfu = _to_float(row.get('MFU', ''))
+        contribution_value = _round(mfu * time_ratio) if mfu is not None else ''
+
+        output_row['model_runtime(us)'] = model_runtime
+        output_row['time_ratio(%)'] = time_ratio
+        output_row[RECOMPUTE_STAGE_COL] = phase
+        output_row['contribution_to_model_mfu'] = ''
+        output_row['contribution_to_model_hfu'] = ''
+        if contribution_value != '':
+            if phase == PHASE_RECOMPUTE:
+                output_row['contribution_to_model_hfu'] = contribution_value
+            else:
+                output_row['contribution_to_model_mfu'] = contribution_value
+
+        output_rows.append(output_row)
+
+    return output_rows, output_headers
 
 def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], model_runtime: float) -> List[Dict[str, Any]]:
     groups = defaultdict(list)
@@ -865,13 +1028,7 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
 
     new_rows = []
     new_col_name = 'stat_type'
-    headers = [h for h in headers if h != RECOMPUTE_STAGE_COL]
-
-    if 'source_path' in headers:
-        source_idx = headers.index('MFU')
-        new_headers = headers[:source_idx] + [new_col_name] + headers[source_idx:]
-    else:
-        new_headers = [new_col_name] + headers
+    new_headers = list(STATISTICS_OUTPUT_HEADERS)
 
     group_records = []
     sorted_groups = sorted(groups.items(), key=lambda item: (get_first_start_time(item[1]), item[0]))
@@ -898,8 +1055,10 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
         avg_mfu = _round(sum(mfu_values) / len(mfu_values))
         mid_mfu = _round(statistics.median(mfu_values))
 
-        total_duration = _round(sum(float(item.get('Duration(us)', 0)) for item in items))
+        duration_values = [(_to_float(item.get('Duration(us)', '')) or 0.0) for item in items]
+        total_duration = _round(sum(duration_values))
         op_count = len(items)
+        avg_duration = _round((sum(duration_values) / op_count) if op_count else 0)
         time_ratio = _round((total_duration / model_runtime) if model_runtime > 0 else 0)
         phase_counts = defaultdict(int)
         for item in items:
@@ -914,21 +1073,24 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
             group_stage = PHASE_FORWARD
 
         max_row[new_col_name] = 'max'
-        # max_row[RECOMPUTE_STAGE_COL] = group_stage
+        max_row[RECOMPUTE_STAGE_COL] = group_stage
         # max_row['op_count'] = op_count
         # max_row['total_duration(us)'] = total_duration
         # max_row['model_runtime(us)'] = model_runtime
         # max_row['time_ratio(%)'] = _round(time_ratio)
 
         min_row[new_col_name] = 'min'
-        # min_row[RECOMPUTE_STAGE_COL] = group_stage
+        min_row[RECOMPUTE_STAGE_COL] = group_stage
         # min_row['op_count'] = op_count
         # min_row['total_duration(us)'] = total_duration
         # min_row['model_runtime(us)'] = model_runtime
         # min_row['time_ratio(%)'] = _round(time_ratio)
 
         avg_row = create_empty_row(new_headers)
+        for col in STATISTICS_AVERAGE_REPRESENTATIVE_COLS:
+            avg_row[col] = representative_row.get(col, '')
         avg_row[new_col_name] = 'ave'
+        avg_row['Duration(us)'] = avg_duration
         avg_row['MFU'] = avg_mfu
         avg_row[RECOMPUTE_STAGE_COL] = group_stage
         avg_row['op_count'] = op_count
@@ -978,69 +1140,35 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
         new_rows.extend(group_record['rows'])
         previous_group_record = group_record
 
-    for col in ['op_count', 'total_duration(us)', 'model_runtime(us)', 'time_ratio(%)']:
-        if col not in new_headers:
-            if 'MFU' in new_headers:
-                mfu_idx = new_headers.index('MFU')
-                new_headers = new_headers[:mfu_idx+1] + [col] + new_headers[mfu_idx+1:]
-            else:
-                new_headers.append(col)
-
-    if RECOMPUTE_STAGE_COL not in new_headers:
-        if 'time_ratio(%)' in new_headers:
-            tr_idx = new_headers.index('time_ratio(%)')
-            new_headers = new_headers[:tr_idx+1] + [RECOMPUTE_STAGE_COL] + new_headers[tr_idx+1:]
-        else:
-            new_headers.append(RECOMPUTE_STAGE_COL)
-
-    contribution_cols = ['contribution_to_model_mfu', 'contribution_to_model_hfu']
-    missing_contribution_cols = [col for col in contribution_cols if col not in new_headers]
-    if missing_contribution_cols:
-        stage_idx = new_headers.index(RECOMPUTE_STAGE_COL)
-        new_headers = new_headers[:stage_idx+1] + missing_contribution_cols + new_headers[stage_idx+1:]
-
-    stat_output_cols = [
-        'op_count',
-        'total_duration(us)',
-        'model_runtime(us)',
-        'time_ratio(%)',
-        RECOMPUTE_STAGE_COL,
-        'contribution_to_model_mfu',
-        'contribution_to_model_hfu',
-    ]
-    new_headers = [h for h in new_headers if h not in stat_output_cols]
-    if 'MFU' in new_headers:
-        mfu_idx = new_headers.index('MFU')
-        new_headers = new_headers[:mfu_idx+1] + stat_output_cols + new_headers[mfu_idx+1:]
-    else:
-        new_headers.extend(stat_output_cols)
-
     return new_rows, new_headers
 
 
 def main():
-    import sys
+    base_dir, num, mbs, seqlen = parse_args()
 
-    if len(sys.argv) > 1:
-        base_dir = Path(sys.argv[1])
-    else:
-        base_dir = Path(r'd:\workfiles\profiles\npu_profiling_ep8cp2_93x480p')
-
-    output_file = base_dir / 'extracted_operators.csv'
+    operator_output_file = base_dir / 'extracted_operators.csv'
+    statistics_output_file = base_dir / 'extracted_operator_statistics.csv'
 
     print(f"Searching for _ascend_pt folders in: {base_dir}")
 
-    csv_files = find_ascend_pt_folders(base_dir)
-    print(f"Found {len(csv_files)} kernel_details.csv files")
+    all_csv_files = find_ascend_pt_folders(base_dir)
+    print(f"Found {len(all_csv_files)} kernel_details.csv files")
 
-    model_runtime = get_model_runtime(base_dir)
+    csv_files = all_csv_files[:num]
+    print(f"Using first {len(csv_files)} kernel_details.csv files (num={num})")
+    print(f"FA 3D shape parameters: mbs={mbs}, seqlen={seqlen}")
+
+    model_runtime = get_model_runtime(csv_files)
     print(f"Model runtime (min Stage): {model_runtime:.2f} us")
 
     all_results = []
 
     for csv_file in csv_files:
         print(f"Processing: {csv_file.parent.parent.name}")
-        results = process_kernel_details(csv_file)
+        try:
+            results = process_kernel_details(csv_file, mbs, seqlen)
+        except ValueError as e:
+            raise SystemExit(f"Error: {e}") from None
         print(f"  Found {len(results)} matching operators")
         all_results.extend(results)
 
@@ -1056,25 +1184,26 @@ def main():
     fa_count = sum(1 for r in all_results if r.get('Type', '') == 'FlashAttentionScore')
     fa_grad_count = sum(1 for r in all_results if r.get('Type', '') == 'FlashAttentionScoreGrad')
 
-    stat_rows, new_headers = compute_statistics(all_results, original_headers, model_runtime)
+    operator_rows, operator_headers = build_operator_output(all_results, original_headers, model_runtime)
+    stat_rows, stat_headers = compute_statistics(all_results, original_headers, model_runtime)
+    stat_output_rows = [row for row in stat_rows if row.get('stat_type') in {'max', 'min', 'ave'}]
 
-    all_rows = all_results + stat_rows
-    output_rows = []
-    for row in all_rows:
-        output_row = dict(row)
-        if output_row.get('stat_type') != 'ave':
-            output_row[RECOMPUTE_STAGE_COL] = ''
-        output_rows.append(output_row)
-
-    with open(output_file, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=new_headers, extrasaction='ignore')
+    with open(operator_output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=operator_headers, extrasaction='ignore')
         writer.writeheader()
-        writer.writerows(output_rows)
+        writer.writerows(operator_rows)
 
-    print(f"\nResults written to: {output_file}")
+    with open(statistics_output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=stat_headers, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(stat_output_rows)
+
+    print(f"\nOperator results written to: {operator_output_file}")
+    print(f"Statistics results written to: {statistics_output_file}")
     print(f"Total records: {len(all_results)}")
-    print(f"Statistical rows: {len(stat_rows)}")
-    print(f"Total rows in output: {len(all_rows)}")
+    print(f"Statistical rows: {len(stat_output_rows)}")
+    print(f"Operator rows in output: {len(operator_rows)}")
+    print(f"Statistics rows in output: {len(stat_output_rows)}")
     print(f"\nOperator breakdown:")
     print(f"  MatMul*: {matmul_count}")
     print(f"  GroupedMatmul*: {grouped_count}")

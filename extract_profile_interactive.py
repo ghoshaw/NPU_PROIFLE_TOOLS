@@ -185,8 +185,25 @@ def is_loss_like(row: Dict[str, Any]) -> bool:
     return 'loss' in text
 
 
-def fa_shape_key(row: Dict[str, Any]) -> Tuple[str, str, str]:
-    return row.get('Type', ''), row.get('Input Shapes', ''), row.get('Output Shapes', '')
+def normalize_attention_shape_key(row: Dict[str, Any]) -> Tuple[Any, ...]:
+    input_tensors = eo.parse_shape_string(row.get('Input Shapes', ''))
+    if len(input_tensors) < 2:
+        return 'raw', row.get('Input Shapes', '')
+
+    q_shape = input_tensors[0]
+    k_shape = input_tensors[1]
+    if len(q_shape) == 4 and len(k_shape) == 4:
+        B, N, S_q, D = q_shape
+        S_k = k_shape[2]
+        return 'BNSD', B, N, S_q, S_k, D
+
+    if len(q_shape) == 3 and len(k_shape) == 3:
+        T_q, N, D = q_shape
+        T_k = k_shape[0]
+        return 'TND', T_q, T_k, N, D
+
+    normalized_inputs = tuple(tuple(shape) for shape in input_tensors[:3])
+    return 'raw', normalized_inputs
 
 
 def parse_fa_params(text: str) -> Dict[str, float]:
@@ -291,7 +308,7 @@ def infer_stages_with_loss_anchor(rows: List[Dict[str, Any]], loss_indices: List
 
 def enrich_operator_row(row: Dict[str, Any],
                         profile_dir: Path,
-                        fa_cache: Dict[Tuple[str, str, str], Dict[str, float]]) -> Dict[str, Any]:
+                        fa_cache: Dict[Tuple[Any, ...], Dict[str, float]]) -> Dict[str, Any]:
     output_row = dict(row)
     type_value = row.get('Type', '')
     input_shapes = row.get('Input Shapes', '')
@@ -310,7 +327,7 @@ def enrich_operator_row(row: Dict[str, Any],
         if flops is not None and bytes_count not in (None, 0):
             intensity = flops / bytes_count
     elif type_value in FA_TYPES:
-        key = fa_shape_key(row)
+        key = normalize_attention_shape_key(row)
         if key not in fa_cache:
             fa_cache[key] = prompt_fa_params(row)
         params = fa_cache[key]
@@ -345,7 +362,7 @@ def enrich_operator_row(row: Dict[str, Any],
 def process_profiles(profile_dirs: List[Path],
                      model_runtime: float) -> Tuple[List[Dict[str, Any]], List[str], int]:
     all_results = []
-    fa_cache: Dict[Tuple[str, str, str], Dict[str, float]] = {}
+    fa_cache: Dict[Tuple[Any, ...], Dict[str, float]] = {}
     original_headers: List[str] = []
     global_index = 0
 
@@ -403,14 +420,13 @@ def statistics_group_key(row: Dict[str, Any]) -> Tuple[str, str, str, str]:
     )
 
 
-def create_stat_row(source_row: Dict[str, Any], stat_type: str, stage: str) -> Dict[str, Any]:
+def create_stat_row(source_row: Dict[str, Any], stat_type: str) -> Dict[str, Any]:
     row = {h: '' for h in STATISTICS_HEADERS}
     for col in STAT_REPRESENTATIVE_COLUMNS:
         row[col] = source_row.get(col, '')
     row['Duration(us)'] = source_row.get('Duration(us)', '')
     row['MFU'] = source_row.get('MFU', '')
     row['stat_type'] = stat_type
-    row[eo.RECOMPUTE_STAGE_COL] = stage
     return row
 
 
@@ -433,8 +449,8 @@ def compute_statistics(all_results: List[Dict[str, Any]], model_runtime: float) 
         representative = sorted_by_duration[0]
         stage = key[3]
 
-        min_row = create_stat_row(min_source, 'min', stage)
-        max_row = create_stat_row(max_source, 'max', stage)
+        min_row = create_stat_row(min_source, 'min')
+        max_row = create_stat_row(max_source, 'max')
 
         duration_values = [(_to_float(item.get('Duration(us)', '')) or 0.0) for item in valid_items]
         mfu_values = [(_to_float(item.get('MFU', '')) or 0.0) for item in valid_items]

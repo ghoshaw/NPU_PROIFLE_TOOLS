@@ -11,6 +11,7 @@ import extract_operators as eo
 FA_TYPES = {'FlashAttentionScore', 'FlashAttentionScoreGrad'}
 OPERATOR_OUTPUT_FILE = 'interactive_extracted_operators.csv'
 STATISTICS_OUTPUT_FILE = 'interactive_operator_statistics.csv'
+VECTOR_OUTPUT_FILE = 'interactive_vector_operators.csv'
 
 ADDED_OPERATOR_COLUMNS = [
     'M',
@@ -88,6 +89,76 @@ STAT_REPRESENTATIVE_COLUMNS = [
 
 INTERNAL_COLUMNS = {'__kernel_index', '__global_index'}
 
+VECTOR_ADDED_COLUMNS = [
+    'logical_bytes',
+    'estimated_bytes',
+    'MBU',
+    'byte_estimation_rule',
+    'model_runtime(us)',
+    'time_ratio(%)',
+    'source_path',
+]
+
+DTYPE_BYTES = {
+    'FLOAT': 4,
+    'FLOAT32': 4,
+    'DT_FLOAT': 4,
+    'DOUBLE': 8,
+    'FLOAT16': 2,
+    'FP16': 2,
+    'DT_FLOAT16': 2,
+    'DT_BF16': 2,
+    'BF16': 2,
+    'INT64': 8,
+    'UINT64': 8,
+    'INT32': 4,
+    'UINT32': 4,
+    'INT16': 2,
+    'UINT16': 2,
+    'INT8': 1,
+    'UINT8': 1,
+    'BOOL': 1,
+}
+
+ELEMENTWISE_TYPES = {
+    'Add',
+    'Sub',
+    'Mul',
+    'RealDiv',
+    'Addcdiv',
+    'NotEqual',
+    'Greater',
+    'Pows',
+    'GeluGrad',
+    'SiluGrad',
+}
+
+MOVE_TYPES = {
+    'Cast',
+    'Transpose',
+    'TransData',
+    'TensorMove',
+    'Slice',
+    'StridedSlice',
+    'ConcatD',
+    'Pack',
+    'RepeatInterleave',
+    'Gelu',
+    'Swish',
+    'RotaryPositionEmbedding',
+    'RotaryPositionEmbeddingGrad',
+    'MoeTokenUnpermute',
+    'MoeTokenUnpermuteGrad',
+    'MoeTokenPermuteGrad',
+}
+
+OUTPUT_ONLY_TYPES = {
+    'ZerosLike',
+    'OnesLike',
+    'Fill',
+    'MemSet',
+}
+
 
 def _round(value: Any) -> Any:
     if isinstance(value, (int, float)) and value != '':
@@ -110,6 +181,43 @@ def _format_number(value: Optional[float]) -> Any:
     if isinstance(value, float) and value.is_integer():
         return int(value)
     return value
+
+
+def product(values: List[int]) -> int:
+    result = 1
+    for value in values:
+        result *= value
+    return result
+
+
+def dtype_size(dtype: str) -> int:
+    normalized = dtype.strip().strip('"').upper()
+    if normalized in {'', 'N/A', 'DT_UNDEFINED'}:
+        return 0
+    return DTYPE_BYTES.get(normalized, 0)
+
+
+def split_dtype_string(dtype_str: str) -> List[str]:
+    if not dtype_str or dtype_str == 'N/A':
+        return []
+    return [part.strip().strip('"') for part in dtype_str.split(';')]
+
+
+def tensor_byte_values(shape_str: str, dtype_str: str) -> List[int]:
+    shapes = eo.parse_shape_string(shape_str)
+    dtypes = split_dtype_string(dtype_str)
+    values = []
+    for idx, shape in enumerate(shapes):
+        if not shape:
+            values.append(0)
+            continue
+        dtype = dtypes[idx] if idx < len(dtypes) else ''
+        values.append(product(shape) * dtype_size(dtype))
+    return values
+
+
+def sum_bytes(values: List[int]) -> int:
+    return sum(value for value in values if value)
 
 
 def parse_args() -> argparse.Namespace:
@@ -281,6 +389,47 @@ def calculate_fa_flops_mfu(params: Dict[str, float],
     return flops, mfu
 
 
+def estimate_vector_bytes(row: Dict[str, Any]) -> Tuple[int, int, str]:
+    op_type = row.get('Type', '')
+    input_bytes = tensor_byte_values(row.get('Input Shapes', ''), row.get('Input Data Types', ''))
+    output_bytes = tensor_byte_values(row.get('Output Shapes', ''), row.get('Output Data Types', ''))
+    logical_bytes = sum_bytes(input_bytes) + sum_bytes(output_bytes)
+
+    if op_type == 'LayerNormV3':
+        x = input_bytes[0] if len(input_bytes) > 0 else 0
+        gamma = input_bytes[1] if len(input_bytes) > 1 else 0
+        beta = input_bytes[2] if len(input_bytes) > 2 else 0
+        y = output_bytes[0] if len(output_bytes) > 0 else 0
+        mean = output_bytes[1] if len(output_bytes) > 1 else 0
+        rstd = output_bytes[2] if len(output_bytes) > 2 else 0
+        return logical_bytes, 2 * x + y + gamma + beta + mean + rstd, 'layer_norm_two_pass'
+
+    if op_type == 'RmsNorm':
+        x = input_bytes[0] if len(input_bytes) > 0 else 0
+        weight = input_bytes[1] if len(input_bytes) > 1 else 0
+        y = output_bytes[0] if len(output_bytes) > 0 else 0
+        rstd = output_bytes[1] if len(output_bytes) > 1 else 0
+        return logical_bytes, 2 * x + y + weight + rstd, 'rms_norm_two_pass'
+
+    if op_type in OUTPUT_ONLY_TYPES:
+        return logical_bytes, sum_bytes(output_bytes), 'output_only'
+
+    if op_type == 'BroadcastTo':
+        first_input = input_bytes[0] if input_bytes else 0
+        return logical_bytes, first_input + sum_bytes(output_bytes), 'broadcast_input_output'
+
+    if op_type.startswith('Foreach'):
+        return logical_bytes, logical_bytes, 'foreach_logical'
+
+    if op_type in ELEMENTWISE_TYPES:
+        return logical_bytes, logical_bytes, 'elementwise_logical'
+
+    if op_type in MOVE_TYPES:
+        return logical_bytes, logical_bytes, 'movement_logical'
+
+    return logical_bytes, logical_bytes, 'logical_fallback'
+
+
 def read_profile_rows(profile_dir: Path) -> Tuple[List[Dict[str, Any]], List[int], List[str]]:
     rows = []
     loss_indices = []
@@ -404,9 +553,46 @@ def process_profiles(profile_dirs: List[Path],
     return all_results, original_headers, len(fa_cache)
 
 
+def process_vector_profiles(profile_dirs: List[Path],
+                            model_runtime: float) -> Tuple[List[Dict[str, Any]], List[str]]:
+    vector_rows = []
+    original_headers: List[str] = []
+
+    for profile_dir in profile_dirs:
+        source_rows, _, headers = read_profile_rows(profile_dir)
+        if not original_headers and headers:
+            original_headers = list(headers)
+
+        for row in source_rows:
+            if row.get('Accelerator Core') != 'AI_VECTOR_CORE':
+                continue
+
+            output_row = dict(row)
+            duration_us = _to_float(row.get('Duration(us)', '')) or 0.0
+            logical_bytes, estimated_bytes, rule = estimate_vector_bytes(row)
+            time_ratio = _round((duration_us / model_runtime) if model_runtime > 0 else 0)
+
+            output_row['logical_bytes'] = logical_bytes
+            output_row['estimated_bytes'] = estimated_bytes
+            output_row['MBU'] = _round(estimated_bytes / (4.0 * duration_us * 1_000_000.0)) if duration_us > 0 else ''
+            output_row['byte_estimation_rule'] = rule
+            output_row['model_runtime(us)'] = model_runtime
+            output_row['time_ratio(%)'] = time_ratio
+            output_row['source_path'] = profile_dir.name
+            vector_rows.append(output_row)
+
+    return vector_rows, original_headers
+
+
 def build_operator_headers(original_headers: List[str]) -> List[str]:
     headers = [h for h in original_headers if h not in ADDED_OPERATOR_COLUMNS and h not in INTERNAL_COLUMNS]
     headers.extend(ADDED_OPERATOR_COLUMNS)
+    return headers
+
+
+def build_vector_headers(original_headers: List[str]) -> List[str]:
+    headers = [h for h in original_headers if h not in VECTOR_ADDED_COLUMNS]
+    headers.extend(VECTOR_ADDED_COLUMNS)
     return headers
 
 
@@ -517,6 +703,7 @@ def main() -> None:
     output_dir = args.profile_path
     operator_output_file = output_dir / OPERATOR_OUTPUT_FILE
     statistics_output_file = output_dir / STATISTICS_OUTPUT_FILE
+    vector_output_file = output_dir / VECTOR_OUTPUT_FILE
 
     print(f"Found {len(profile_dirs)} profile folder(s)")
     for profile_dir in profile_dirs:
@@ -531,9 +718,12 @@ def main() -> None:
 
     operator_headers = build_operator_headers(original_headers)
     stat_rows, stat_headers = compute_statistics(all_results, model_runtime)
+    vector_rows, vector_original_headers = process_vector_profiles(profile_dirs, model_runtime)
+    vector_headers = build_vector_headers(vector_original_headers)
 
     write_csv(operator_output_file, operator_headers, all_results)
     write_csv(statistics_output_file, stat_headers, stat_rows)
+    write_csv(vector_output_file, vector_headers, vector_rows)
 
     matmul_count = sum(1 for row in all_results if row.get('Type', '').startswith('MatMulV') or
                        (row.get('Type', '').startswith('MatMul') and not row.get('Type', '').startswith('GroupedMatmul')))
@@ -543,8 +733,10 @@ def main() -> None:
 
     print(f"\nOperator results written to: {operator_output_file}")
     print(f"Statistics results written to: {statistics_output_file}")
+    print(f"Vector results written to: {vector_output_file}")
     print(f"Operator rows: {len(all_results)}")
     print(f"Statistics rows: {len(stat_rows)}")
+    print(f"Vector rows: {len(vector_rows)}")
     print(f"FA/FAG shape prompts answered: {fa_prompt_count}")
     print("\nOperator breakdown:")
     print(f"  MatMul*: {matmul_count}")

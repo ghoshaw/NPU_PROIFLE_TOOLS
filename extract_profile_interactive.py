@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -12,6 +13,21 @@ FA_TYPES = {'FlashAttentionScore', 'FlashAttentionScoreGrad'}
 OPERATOR_OUTPUT_FILE = 'interactive_extracted_operators.csv'
 STATISTICS_OUTPUT_FILE = 'interactive_operator_statistics.csv'
 VECTOR_OUTPUT_FILE = 'interactive_vector_operators.csv'
+COMM_OUTPUT_FILE = 'interactive_comm_operators.csv'
+
+TARGET_COMM_PREFIXES = [
+    'hcom_allGather_AicpuKernel_',
+    'hcom_reduceScatter_AicpuKernel_',
+    'hcom_allGather__',
+    'hcom_reduceScatter__',
+    'hcom_alltoall__',
+    'hcom_alltoallv__',
+    'hcom_alltoall_AicpuKernel_',
+    'hcom_alltoallv_AicpuKernel_',
+    'MEMCPY_ASYNC',
+]
+
+COMM_HEADERS = ['source_folder', 'name', 'dur', 'data_type', 'count', 'Type']
 
 ADDED_OPERATOR_COLUMNS = [
     'M',
@@ -250,6 +266,10 @@ def has_profile_files(profile_dir: Path) -> bool:
     return (output_dir / 'kernel_details.csv').exists() and (output_dir / 'step_trace_time.csv').exists()
 
 
+def has_trace_view(profile_dir: Path) -> bool:
+    return trace_view_path(profile_dir).exists()
+
+
 def find_profile_dirs(profile_path: Path, num: int) -> List[Path]:
     if has_profile_files(profile_path):
         return [profile_path]
@@ -261,12 +281,27 @@ def find_profile_dirs(profile_path: Path, num: int) -> List[Path]:
     return profile_dirs[:num]
 
 
+def find_comm_profile_dirs(profile_path: Path) -> List[Path]:
+    if profile_path.name.endswith('_pt') or profiler_output_dir(profile_path).exists():
+        return [profile_path]
+
+    profile_dirs = []
+    for item in profile_path.iterdir():
+        if item.is_dir() and item.name.endswith('_pt'):
+            profile_dirs.append(item)
+    return profile_dirs
+
+
 def kernel_details_path(profile_dir: Path) -> Path:
     return profiler_output_dir(profile_dir) / 'kernel_details.csv'
 
 
 def step_trace_path(profile_dir: Path) -> Path:
     return profiler_output_dir(profile_dir) / 'step_trace_time.csv'
+
+
+def trace_view_path(profile_dir: Path) -> Path:
+    return profiler_output_dir(profile_dir) / 'trace_view.json'
 
 
 def get_model_runtime(profile_dirs: List[Path]) -> float:
@@ -584,6 +619,68 @@ def process_vector_profiles(profile_dirs: List[Path],
     return vector_rows, original_headers
 
 
+def classify_comm_type(name: str, tid: Any) -> Optional[str]:
+    if 'Aicpu' in name and 'hcom' in name:
+        return 'AICPU'
+    if 'hcom' in name:
+        return 'CCU'
+    if 'MEMCPY_ASYNC' in name:
+        try:
+            if int(float(tid)) == 56:
+                return 'h2d or h2h'
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def process_comm_profiles(profile_dirs: List[Path]) -> List[Dict[str, Any]]:
+    comm_rows = []
+    for profile_dir in profile_dirs:
+        json_path = trace_view_path(profile_dir)
+        if not json_path.exists():
+            print(f"Skipping communication trace: {json_path}")
+            continue
+
+        print(f"Parsing communication trace: {json_path}")
+        try:
+            with json_path.open('r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Error parsing {json_path}: {e}")
+            continue
+
+        if not isinstance(data, list):
+            print(f"Skipping communication trace with unexpected JSON root: {json_path}")
+            continue
+
+        for obj in data:
+            if not isinstance(obj, dict):
+                continue
+
+            name = obj.get('name', '')
+            if not isinstance(name, str) or not any(name.startswith(prefix) for prefix in TARGET_COMM_PREFIXES):
+                continue
+
+            args = obj.get('args') or {}
+            if not isinstance(args, dict):
+                args = {}
+
+            comm_type = classify_comm_type(name, obj.get('tid', ''))
+            if comm_type is None:
+                continue
+
+            comm_rows.append({
+                'source_folder': profile_dir.name,
+                'name': name,
+                'dur': obj.get('dur', ''),
+                'data_type': args.get('data_type', 'BF16'),
+                'count': args.get('count', ''),
+                'Type': comm_type,
+            })
+
+    return comm_rows
+
+
 def build_operator_headers(original_headers: List[str]) -> List[str]:
     headers = [h for h in original_headers if h not in ADDED_OPERATOR_COLUMNS and h not in INTERNAL_COLUMNS]
     headers.extend(ADDED_OPERATOR_COLUMNS)
@@ -704,6 +801,7 @@ def main() -> None:
     operator_output_file = output_dir / OPERATOR_OUTPUT_FILE
     statistics_output_file = output_dir / STATISTICS_OUTPUT_FILE
     vector_output_file = output_dir / VECTOR_OUTPUT_FILE
+    comm_output_file = output_dir / COMM_OUTPUT_FILE
 
     print(f"Found {len(profile_dirs)} profile folder(s)")
     for profile_dir in profile_dirs:
@@ -720,10 +818,13 @@ def main() -> None:
     stat_rows, stat_headers = compute_statistics(all_results, model_runtime)
     vector_rows, vector_original_headers = process_vector_profiles(profile_dirs, model_runtime)
     vector_headers = build_vector_headers(vector_original_headers)
+    comm_profile_dirs = find_comm_profile_dirs(args.profile_path)
+    comm_rows = process_comm_profiles(comm_profile_dirs)
 
     write_csv(operator_output_file, operator_headers, all_results)
     write_csv(statistics_output_file, stat_headers, stat_rows)
     write_csv(vector_output_file, vector_headers, vector_rows)
+    write_csv(comm_output_file, COMM_HEADERS, comm_rows)
 
     matmul_count = sum(1 for row in all_results if row.get('Type', '').startswith('MatMulV') or
                        (row.get('Type', '').startswith('MatMul') and not row.get('Type', '').startswith('GroupedMatmul')))
@@ -734,9 +835,12 @@ def main() -> None:
     print(f"\nOperator results written to: {operator_output_file}")
     print(f"Statistics results written to: {statistics_output_file}")
     print(f"Vector results written to: {vector_output_file}")
+    print(f"Communication results written to: {comm_output_file}")
     print(f"Operator rows: {len(all_results)}")
     print(f"Statistics rows: {len(stat_rows)}")
     print(f"Vector rows: {len(vector_rows)}")
+    print(f"Communication profile folders scanned: {len(comm_profile_dirs)}")
+    print(f"Communication rows: {len(comm_rows)}")
     print(f"FA/FAG shape prompts answered: {fa_prompt_count}")
     print("\nOperator breakdown:")
     print(f"  MatMul*: {matmul_count}")

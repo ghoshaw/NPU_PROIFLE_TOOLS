@@ -251,9 +251,17 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help='Number of *_pt folders to include when profile_path is a parent directory.',
     )
+    parser.add_argument(
+        '--device-flops',
+        type=float,
+        required=True,
+        help='Device compute throughput in TFLOPS, for example A5=432 or A3=354.',
+    )
     args = parser.parse_args()
     if args.num < 1:
         parser.error('num must be a positive integer')
+    if args.device_flops <= 0:
+        parser.error('device-flops must be a positive number')
     return args
 
 
@@ -383,11 +391,12 @@ def prompt_fa_params(row: Dict[str, Any]) -> Dict[str, float]:
 def calculate_mm_flops_mfu(M: Optional[int],
                            K: Optional[int],
                            N: Optional[int],
-                           duration_us: float) -> Tuple[Optional[float], Optional[float]]:
+                           duration_us: float,
+                           device_flops: float) -> Tuple[Optional[float], Optional[float]]:
     if duration_us <= 0 or M is None or K is None or N is None:
         return None, None
     flops = 2.0 * M * K * N
-    mfu = flops / 432.0 / duration_us / 1_000_000.0
+    mfu = flops / device_flops / duration_us / 1_000_000.0
     return flops, mfu
 
 
@@ -404,7 +413,8 @@ def calculate_mm_mbu(M: Optional[int],
 
 def calculate_fa_flops_mfu(params: Dict[str, float],
                            op_type: str,
-                           duration_us: float) -> Tuple[Optional[float], Optional[float]]:
+                           duration_us: float,
+                           device_flops: float) -> Tuple[Optional[float], Optional[float]]:
     if duration_us <= 0:
         return None, None
 
@@ -420,7 +430,7 @@ def calculate_fa_flops_mfu(params: Dict[str, float],
     )
     if op_type == 'FlashAttentionScoreGrad':
         flops *= 2.5
-    mfu = flops / 432.0 / duration_us / 1_000_000.0
+    mfu = flops / device_flops / duration_us / 1_000_000.0
     return flops, mfu
 
 
@@ -492,7 +502,8 @@ def infer_stages_with_loss_anchor(rows: List[Dict[str, Any]], loss_indices: List
 
 def enrich_operator_row(row: Dict[str, Any],
                         profile_dir: Path,
-                        fa_cache: Dict[Tuple[Any, ...], Dict[str, float]]) -> Dict[str, Any]:
+                        fa_cache: Dict[Tuple[Any, ...], Dict[str, float]],
+                        device_flops: float) -> Dict[str, Any]:
     output_row = dict(row)
     type_value = row.get('Type', '')
     input_shapes = row.get('Input Shapes', '')
@@ -502,11 +513,11 @@ def enrich_operator_row(row: Dict[str, Any],
     M = K = N = None
     B = N_heads = S_q = S_k = D = SN = causal = None
     flops = mfu = mbu = intensity = None
-    ai = 432 / 4.0
+    ai = device_flops / 4.0
 
     if eo.is_matmul_or_grouped(type_value):
         M, K, N = eo.extract_matmul_dims(input_shapes, output_shapes, type_value.startswith('GroupedMatmul'))
-        flops, mfu = calculate_mm_flops_mfu(M, K, N, duration_us)
+        flops, mfu = calculate_mm_flops_mfu(M, K, N, duration_us, device_flops)
         bytes_count, mbu = calculate_mm_mbu(M, K, N, duration_us)
         if flops is not None and bytes_count not in (None, 0):
             intensity = flops / bytes_count
@@ -522,7 +533,7 @@ def enrich_operator_row(row: Dict[str, Any],
         D = params['D']
         SN = params['SN']
         causal = params['causal']
-        flops, mfu = calculate_fa_flops_mfu(params, type_value, duration_us)
+        flops, mfu = calculate_fa_flops_mfu(params, type_value, duration_us, device_flops)
 
     output_row['M'] = _format_number(M)
     output_row['K'] = _format_number(K)
@@ -544,7 +555,8 @@ def enrich_operator_row(row: Dict[str, Any],
 
 
 def process_profiles(profile_dirs: List[Path],
-                     model_runtime: float) -> Tuple[List[Dict[str, Any]], List[str], int]:
+                     model_runtime: float,
+                     device_flops: float) -> Tuple[List[Dict[str, Any]], List[str], int]:
     all_results = []
     fa_cache: Dict[Tuple[Any, ...], Dict[str, float]] = {}
     original_headers: List[str] = []
@@ -559,7 +571,7 @@ def process_profiles(profile_dirs: List[Path],
         for idx, row in enumerate(source_rows):
             if not is_target_operator(row.get('Type', '')):
                 continue
-            enriched = enrich_operator_row(row, profile_dir, fa_cache)
+            enriched = enrich_operator_row(row, profile_dir, fa_cache, device_flops)
             enriched['__kernel_index'] = idx
             enriched['__global_index'] = global_index
             global_index += 1
@@ -809,8 +821,9 @@ def main() -> None:
 
     model_runtime = get_model_runtime(profile_dirs)
     print(f"Model runtime Stage sum: {model_runtime:.2f} us")
+    print(f"Device FLOPS: {args.device_flops}")
 
-    all_results, original_headers, fa_prompt_count = process_profiles(profile_dirs, model_runtime)
+    all_results, original_headers, fa_prompt_count = process_profiles(profile_dirs, model_runtime, args.device_flops)
     if not all_results:
         raise SystemExit('No matching operators found')
 

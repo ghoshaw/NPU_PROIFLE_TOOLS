@@ -123,9 +123,7 @@ def extract_matmul_dims(input_shapes: str, output_shapes: str, is_grouped: bool 
     return None, None, None
 
 
-def extract_fa_dims(input_shapes: str,
-                    mbs: int = 1,
-                    seqlen: int = 1) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
+def extract_fa_dims(input_shapes: str) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int], Optional[int], Optional[int]]:
     input_tensors = parse_shape_string(input_shapes)
 
     if not input_tensors:
@@ -138,15 +136,8 @@ def extract_fa_dims(input_shapes: str,
         S_key = input_tensors[1][2] if len(input_tensors) > 1 and len(input_tensors[1]) > 2 else S
         return B, N, S, D, S_key, 1
     elif len(first_tensor) == 3:
-        T, N, D = first_tensor[0], first_tensor[1], first_tensor[2]
-        divisor = mbs * seqlen
-        if T % divisor != 0:
-            raise ValueError(
-                f"3D FA shape requires T divisible by mbs*seqlen, got input_shapes={input_shapes}, "
-                f"T={T}, mbs={mbs}, seqlen={seqlen}"
-            )
-        seqs = T // divisor
-        return mbs, N, seqlen, D, seqlen, seqs
+        _, N, D = first_tensor[0], first_tensor[1], first_tensor[2]
+        return None, N, None, D, None, None
 
     return None, None, None, None, None, None
 
@@ -154,6 +145,7 @@ def extract_fa_dims(input_shapes: str,
 def calculate_flops_mfu(M: Optional[int], K: Optional[int], N: Optional[int],
                         B: Optional[int], S: Optional[int], S_key: Optional[int], D: Optional[int],
                         op_type: str, duration_us: float,
+                        device_flops: float,
                         fa_seq_count: Optional[int] = 1) -> Tuple[Optional[float], Optional[float]]:
     if duration_us <= 0:
         return None, None
@@ -175,7 +167,7 @@ def calculate_flops_mfu(M: Optional[int], K: Optional[int], N: Optional[int],
             flops = 4.0 * B * S * S_key * N_val * D * seq_count * 2.5
 
     if flops is not None:
-        mfu = flops / (432.0 * duration_us * 1_000_000.0)
+        mfu = flops / (device_flops * duration_us * 1_000_000.0)
         return flops, mfu
 
     return None, None
@@ -416,7 +408,7 @@ def classify_matmul_recompute_by_backward_counts(rows: List[Dict[str, Any]]) -> 
             rows[idx][RECOMPUTE_STAGE_COL] = PHASE_RECOMPUTE
 
 
-def process_kernel_details(csv_path: Path, mbs: int = 1, seqlen: int = 1) -> List[Dict[str, Any]]:
+def process_kernel_details(csv_path: Path, device_flops: float) -> List[Dict[str, Any]]:
     results = []
 
     with open(csv_path, 'r', encoding='utf-8') as f:
@@ -453,16 +445,13 @@ def process_kernel_details(csv_path: Path, mbs: int = 1, seqlen: int = 1) -> Lis
 
             if is_matmul or is_grouped:
                 M, K, N = extract_matmul_dims(input_shapes, output_shapes, is_grouped)
-                flops, mfu = calculate_flops_mfu(M, K, N, None, None, None, None, type_val, duration_us)
+                flops, mfu = calculate_flops_mfu(M, K, N, None, None, None, None, type_val, duration_us, device_flops)
                 flops_bw, mbu = calculate_flops_mbu(M, K, N, None, None, None, None, type_val, duration_us)
                 I = flops / flops_bw
             elif is_fa or is_fa_grad:
-                try:
-                    B, N_head, S, D, S_key, fa_seq_count = extract_fa_dims(input_shapes, mbs, seqlen)
-                except ValueError as e:
-                    raise ValueError(f"{e}; source={csv_path}") from e
+                B, N_head, S, D, S_key, fa_seq_count = extract_fa_dims(input_shapes)
                 flops, mfu = calculate_flops_mfu(
-                    None, None, N_head, B, S, S_key, D, type_val, duration_us, fa_seq_count
+                    None, None, N_head, B, S, S_key, D, type_val, duration_us, device_flops, fa_seq_count
                 )
 
             result_row = dict(row)
@@ -478,7 +467,7 @@ def process_kernel_details(csv_path: Path, mbs: int = 1, seqlen: int = 1) -> Lis
             result_row['MFU'] = _round(mfu*100) if mfu is not None else ''
             result_row['MBU'] = _round(mbu) if mbu is not None else ''
             result_row['I'] = _round(I) if I is not None else ''
-            result_row['AI'] = 432/4.0
+            result_row['AI'] = device_flops / 4.0
             result_row['source_path'] = csv_path.parent.parent.name if csv_path else ''
 
             results.append(result_row)
@@ -930,14 +919,12 @@ def _round(v):
     return v
 
 
-def parse_args() -> Tuple[Path, int, int, int]:
+def parse_args() -> Tuple[Path, int, float]:
     parser = argparse.ArgumentParser(
         description='Extract MM/GMM/FA operators and shape-level statistics from Ascend profiler output.'
     )
     parser.add_argument(
         'profile_dir',
-        nargs='?',
-        default=r'd:\workfiles\profiles\npu_profiling_ep8cp2_93x480p',
         help='Profile directory that contains *_ascend_pt folders.',
     )
     parser.add_argument(
@@ -953,16 +940,10 @@ def parse_args() -> Tuple[Path, int, int, int]:
         help='Number of *_ascend_pt folders to include.',
     )
     parser.add_argument(
-        '--mbs',
-        type=int,
-        default=1,
-        help='Micro batch size used for 3D FlashAttention shape inference.',
-    )
-    parser.add_argument(
-        '--seqlen',
-        type=int,
-        default=1,
-        help='Sequence length used for 3D FlashAttention shape inference.',
+        '--device-flops',
+        type=float,
+        required=True,
+        help='Device compute throughput in TFLOPS, for example A5=432 or A3=354.',
     )
     args = parser.parse_args()
 
@@ -974,12 +955,10 @@ def parse_args() -> Tuple[Path, int, int, int]:
         num = 1
     if num < 1:
         parser.error('num must be a positive integer')
-    if args.mbs < 1:
-        parser.error('mbs must be a positive integer')
-    if args.seqlen < 1:
-        parser.error('seqlen must be a positive integer')
+    if args.device_flops <= 0:
+        parser.error('device-flops must be a positive number')
 
-    return Path(args.profile_dir), num, args.mbs, args.seqlen
+    return Path(args.profile_dir), num, args.device_flops
 
 
 def build_operator_output(all_results: List[Dict[str, Any]],
@@ -1144,7 +1123,7 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
 
 
 def main():
-    base_dir, num, mbs, seqlen = parse_args()
+    base_dir, num, device_flops = parse_args()
 
     operator_output_file = base_dir / 'extracted_operators.csv'
     statistics_output_file = base_dir / 'extracted_operator_statistics.csv'
@@ -1156,7 +1135,7 @@ def main():
 
     csv_files = all_csv_files[:num]
     print(f"Using first {len(csv_files)} kernel_details.csv files (num={num})")
-    print(f"FA 3D shape parameters: mbs={mbs}, seqlen={seqlen}")
+    print(f"Device FLOPS: {device_flops}")
 
     model_runtime = get_model_runtime(csv_files)
     print(f"Model runtime (min Stage): {model_runtime:.2f} us")
@@ -1165,10 +1144,7 @@ def main():
 
     for csv_file in csv_files:
         print(f"Processing: {csv_file.parent.parent.name}")
-        try:
-            results = process_kernel_details(csv_file, mbs, seqlen)
-        except ValueError as e:
-            raise SystemExit(f"Error: {e}") from None
+        results = process_kernel_details(csv_file, device_flops)
         print(f"  Found {len(results)} matching operators")
         all_results.extend(results)
 

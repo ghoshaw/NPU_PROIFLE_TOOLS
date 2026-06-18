@@ -490,14 +490,7 @@ def read_profile_rows(profile_dir: Path) -> Tuple[List[Dict[str, Any]], List[int
 
 
 def infer_stages_with_loss_anchor(rows: List[Dict[str, Any]], loss_indices: List[int]) -> None:
-    eo.infer_recompute_stages(rows)
-    if not loss_indices:
-        return
-
-    first_loss_idx = min(loss_indices)
-    for row in rows:
-        if row.get('__kernel_index', 0) < first_loss_idx:
-            row[eo.RECOMPUTE_STAGE_COL] = eo.PHASE_FORWARD
+    eo.infer_recompute_stages(rows, loss_indices)
 
 
 def enrich_operator_row(row: Dict[str, Any],
@@ -578,6 +571,22 @@ def process_profiles(profile_dirs: List[Path],
             extracted_rows.append(enriched)
 
         infer_stages_with_loss_anchor(extracted_rows, loss_indices)
+        diagnostics = eo.get_stage_diagnostics(extracted_rows, loss_indices)
+        phase_counts = diagnostics['phase_counts']
+        print(
+            "Stage inference: "
+            f"profile={profile_dir.name}, "
+            f"forward={phase_counts.get(eo.PHASE_FORWARD, 0)}, "
+            f"recompute={phase_counts.get(eo.PHASE_RECOMPUTE, 0)}, "
+            f"backward={phase_counts.get(eo.PHASE_BACKWARD, 0)}, "
+            f"unknown={phase_counts.get(eo.PHASE_UNKNOWN, 0)}, "
+            f"loss_count={diagnostics['loss_count']}, "
+            f"first_loss={diagnostics['first_loss_index']}, "
+            f"last_loss={diagnostics['last_loss_index']}, "
+            f"first_backward_extracted={diagnostics['first_backward_extracted_index']}"
+        )
+        if phase_counts.get(eo.PHASE_RECOMPUTE, 0) == 0 and diagnostics['loss_count']:
+            print(f"WARNING: loss anchors exist but no recompute operators were inferred for {profile_dir.name}")
         for row in extracted_rows:
             phase = row.get(eo.RECOMPUTE_STAGE_COL, eo.PHASE_FORWARD)
             duration_us = _to_float(row.get('Duration(us)', '')) or 0.0
@@ -590,9 +599,9 @@ def process_profiles(profile_dirs: List[Path],
             row['contribution_to_model_mfu'] = ''
             row['contribution_to_model_hfu'] = ''
             if contribution != '':
-                if phase == eo.PHASE_RECOMPUTE:
+                if phase in {eo.PHASE_RECOMPUTE, eo.PHASE_UNKNOWN}:
                     row['contribution_to_model_hfu'] = contribution
-                else:
+                elif phase in {eo.PHASE_FORWARD, eo.PHASE_BACKWARD}:
                     row['contribution_to_model_mfu'] = contribution
 
         all_results.extend(extracted_rows)
@@ -767,9 +776,9 @@ def compute_statistics(all_results: List[Dict[str, Any]], model_runtime: float) 
         avg_row['model_runtime(us)'] = model_runtime
         avg_row['time_ratio(%)'] = time_ratio
         avg_row[eo.RECOMPUTE_STAGE_COL] = stage
-        if stage == eo.PHASE_RECOMPUTE:
+        if stage in {eo.PHASE_RECOMPUTE, eo.PHASE_UNKNOWN}:
             avg_row['contribution_to_model_hfu'] = contribution
-        else:
+        elif stage in {eo.PHASE_FORWARD, eo.PHASE_BACKWARD}:
             avg_row['contribution_to_model_mfu'] = contribution
 
         phase_counts = defaultdict(int)

@@ -4,13 +4,16 @@ import csv
 import re
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
-from collections import defaultdict
+from collections import Counter, defaultdict
 import statistics
 
 RECOMPUTE_STAGE_COL = 'recompute_stage'
 PHASE_FORWARD = 'forward'
 PHASE_RECOMPUTE = 'recompute'
 PHASE_BACKWARD = 'backward'
+PHASE_UNKNOWN = 'unknown'
+KNOWN_PHASES = {PHASE_FORWARD, PHASE_RECOMPUTE, PHASE_BACKWARD, PHASE_UNKNOWN}
+INTERNAL_COLUMNS = {'__kernel_index', 'backward_parent_key', 'backward_role'}
 
 STATISTICS_OUTPUT_HEADERS = [
     'Name',
@@ -226,7 +229,175 @@ def is_weight_grad_like(row: Dict[str, Any]) -> bool:
     return same_activation_axis and len(output) >= 2 and output[0] != first_input[0]
 
 
-def infer_recompute_stages(rows: List[Dict[str, Any]]) -> None:
+def _tuple_shape(shape: List[int]) -> Tuple[int, ...]:
+    return tuple(shape)
+
+
+def _non_empty_shape_tuples(shape_str: str) -> List[Tuple[int, ...]]:
+    return [_tuple_shape(shape) for shape in parse_shape_string(shape_str) if shape]
+
+
+def _transpose_2d(shape: Tuple[int, ...]) -> Tuple[int, ...]:
+    if len(shape) == 2:
+        return shape[1], shape[0]
+    return shape
+
+
+def get_matmul_semantic_forward_key(row: Dict[str, Any]) -> Optional[Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]]:
+    type_val = row.get('Type', '')
+    if not is_matmul_or_grouped(type_val):
+        return None
+
+    input_tensors = _non_empty_shape_tuples(row.get('Input Shapes', ''))
+    output_tensors = _non_empty_shape_tuples(row.get('Output Shapes', ''))
+    if len(input_tensors) < 2 or not output_tensors:
+        return None
+
+    x_shape = input_tensors[0]
+    output_shape = output_tensors[0]
+    if len(x_shape) < 2 or len(output_shape) < 2:
+        return None
+
+    family = get_matmul_family(type_val)
+    if family == 'GroupedMatmul':
+        raw_weight = input_tensors[1]
+        if len(raw_weight) >= 3:
+            weight_shape = raw_weight[-2], raw_weight[-1]
+        elif len(raw_weight) >= 2:
+            weight_shape = raw_weight[-2], raw_weight[-1]
+        else:
+            return None
+        logical_output = (x_shape[0], weight_shape[-1])
+        return family, x_shape, weight_shape, logical_output
+
+    raw_weight = input_tensors[1]
+    if len(raw_weight) < 2:
+        return None
+
+    # Ascend MatMul commonly stores the second operand as W^T.
+    if raw_weight[0] == output_shape[-1] and raw_weight[-1] == x_shape[-1]:
+        weight_shape = raw_weight[-1], raw_weight[0]
+    elif raw_weight[0] == x_shape[-1]:
+        weight_shape = raw_weight[0], raw_weight[-1]
+    else:
+        weight_shape = _transpose_2d(raw_weight)
+
+    logical_output = (x_shape[0], weight_shape[-1])
+    return family, x_shape, weight_shape, logical_output
+
+
+def get_matmul_raw_forward_key(row: Dict[str, Any]) -> Optional[Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]]:
+    type_val = row.get('Type', '')
+    if not is_matmul_or_grouped(type_val):
+        return None
+
+    input_tensors = _non_empty_shape_tuples(row.get('Input Shapes', ''))
+    output_tensors = _non_empty_shape_tuples(row.get('Output Shapes', ''))
+    if len(input_tensors) < 2 or not output_tensors:
+        return None
+
+    return get_matmul_family(type_val), input_tensors[0], input_tensors[1], output_tensors[0]
+
+
+def get_matmul_forward_key(row: Dict[str, Any]) -> Optional[Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]]:
+    return get_matmul_semantic_forward_key(row) or get_matmul_raw_forward_key(row)
+
+
+def get_matmul_backward_role_for_forward_key(
+        row: Dict[str, Any],
+        forward_key: Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]) -> Optional[str]:
+    type_val = row.get('Type', '')
+    if not is_matmul_or_grouped(type_val):
+        return None
+
+    family, x_shape, weight_shape, output_shape = forward_key
+    if get_matmul_family(type_val) != family:
+        return None
+
+    input_tensors = _non_empty_shape_tuples(row.get('Input Shapes', ''))
+    output_tensors = _non_empty_shape_tuples(row.get('Output Shapes', ''))
+    if len(input_tensors) < 2 or not output_tensors:
+        return None
+
+    row_output = output_tensors[0]
+    input_set = set(input_tensors)
+    weight_aliases = {weight_shape, _transpose_2d(weight_shape)}
+    has_weight_input = any(alias in input_set for alias in weight_aliases)
+    if family == 'GroupedMatmul':
+        has_weight_input = has_weight_input or any(
+            len(tensor) >= 3 and (tensor[-2:] == weight_shape or tensor[-2:] == _transpose_2d(weight_shape))
+            for tensor in input_tensors
+        )
+
+    if row_output == x_shape and output_shape in input_set and has_weight_input:
+        return 'dx'
+
+    output_aliases = {weight_shape, _transpose_2d(weight_shape)}
+    grouped_output_aliases = output_aliases
+    if family == 'GroupedMatmul':
+        grouped_output_aliases = set(output_aliases)
+        for tensor in output_tensors:
+            if len(tensor) >= 3 and tensor[-2:] == weight_shape:
+                grouped_output_aliases.add(tensor)
+            if len(tensor) >= 3 and tensor[-2:] == _transpose_2d(weight_shape):
+                grouped_output_aliases.add(tensor)
+
+    if (row_output in grouped_output_aliases and
+            x_shape in input_set and output_shape in input_set):
+        return 'dw'
+
+    return None
+
+
+def choose_semantic_backward_match(
+        row: Dict[str, Any],
+        forward_keys: set) -> Tuple[Optional[Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]], Optional[str]]:
+    matches = []
+    for forward_key in forward_keys:
+        role = get_matmul_backward_role_for_forward_key(row, forward_key)
+        if role is not None:
+            matches.append((forward_key, role))
+
+    if not matches:
+        return None, None
+
+    role_order = {'dx': 0, 'dw': 1}
+    matches.sort(key=lambda item: (role_order[item[1]], item[0][0], item[0][1], item[0][2], item[0][3]))
+    return matches[0]
+
+
+def get_attention_shape_key(row: Dict[str, Any]) -> Optional[Tuple[str, Tuple[Tuple[int, ...], ...], Tuple[Tuple[int, ...], ...]]]:
+    type_val = row.get('Type', '')
+    if type_val not in {'FlashAttentionScore', 'FlashAttentionScoreGrad'}:
+        return None
+
+    input_tensors = _non_empty_shape_tuples(row.get('Input Shapes', ''))
+    output_tensors = _non_empty_shape_tuples(row.get('Output Shapes', ''))
+    if len(input_tensors) < 2:
+        return None
+
+    qkv = tuple(input_tensors[:3]) if len(input_tensors) >= 3 else tuple(input_tensors[:2])
+    primary_outputs = tuple(output_tensors[:1])
+    return 'FlashAttention', qkv, primary_outputs
+
+
+def get_stage_diagnostics(rows: List[Dict[str, Any]], loss_indices: Optional[List[int]] = None) -> Dict[str, Any]:
+    phase_counts = Counter(row.get(RECOMPUTE_STAGE_COL, PHASE_UNKNOWN) for row in rows)
+    first_backward_idx = next(
+        (idx for idx, row in enumerate(rows) if row.get(RECOMPUTE_STAGE_COL) == PHASE_BACKWARD),
+        None
+    )
+    loss_indices = loss_indices or []
+    return {
+        'phase_counts': dict(phase_counts),
+        'loss_count': len(loss_indices),
+        'first_loss_index': min(loss_indices) if loss_indices else None,
+        'last_loss_index': max(loss_indices) if loss_indices else None,
+        'first_backward_extracted_index': first_backward_idx,
+    }
+
+
+def infer_recompute_stages_legacy(rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
 
@@ -311,6 +482,110 @@ def infer_recompute_stages(rows: List[Dict[str, Any]]) -> None:
 
     refine_backward_stages_by_shape(rows)
     classify_matmul_recompute_by_backward_counts(rows)
+
+
+def infer_recompute_stages(rows: List[Dict[str, Any]], loss_indices: Optional[List[int]] = None) -> None:
+    if not rows:
+        return
+
+    if not loss_indices:
+        infer_recompute_stages_legacy(rows)
+        return
+
+    first_loss_idx = min(loss_indices)
+    last_loss_idx = max(loss_indices)
+
+    forward_matmul_keys = set()
+    forward_attention_keys = set()
+    for row in rows:
+        kernel_idx = row.get('__kernel_index')
+        if kernel_idx is None or kernel_idx >= first_loss_idx:
+            continue
+
+        type_val = row.get('Type', '')
+        if is_matmul_or_grouped(type_val):
+            forward_key = get_matmul_forward_key(row)
+            if forward_key is not None:
+                forward_matmul_keys.add(forward_key)
+        elif type_val == 'FlashAttentionScore':
+            attention_key = get_attention_shape_key(row)
+            if attention_key is not None:
+                forward_attention_keys.add(attention_key)
+
+    for row in rows:
+        kernel_idx = row.get('__kernel_index')
+        type_val = row.get('Type', '')
+
+        if kernel_idx is not None and kernel_idx < first_loss_idx:
+            row[RECOMPUTE_STAGE_COL] = PHASE_FORWARD
+            continue
+
+        if kernel_idx is not None and kernel_idx <= last_loss_idx:
+            row[RECOMPUTE_STAGE_COL] = PHASE_UNKNOWN
+            continue
+
+        if type_val == 'FlashAttentionScoreGrad':
+            row[RECOMPUTE_STAGE_COL] = PHASE_BACKWARD
+            continue
+
+        if type_val == 'FlashAttentionScore':
+            attention_key = get_attention_shape_key(row)
+            row[RECOMPUTE_STAGE_COL] = PHASE_RECOMPUTE if attention_key in forward_attention_keys else PHASE_UNKNOWN
+            continue
+
+        if is_matmul_or_grouped(type_val):
+            forward_key = get_matmul_forward_key(row)
+            backward_key, role = choose_semantic_backward_match(row, forward_matmul_keys)
+            row['backward_parent_key'] = ''
+            if role is not None:
+                if role == 'dx' and forward_key in forward_matmul_keys:
+                    row[RECOMPUTE_STAGE_COL] = PHASE_RECOMPUTE
+                else:
+                    row[RECOMPUTE_STAGE_COL] = PHASE_BACKWARD
+                    row['backward_role'] = role
+                    row['backward_parent_key'] = repr(backward_key)
+                continue
+
+            if forward_key in forward_matmul_keys:
+                row[RECOMPUTE_STAGE_COL] = PHASE_RECOMPUTE
+            else:
+                row[RECOMPUTE_STAGE_COL] = PHASE_UNKNOWN
+            continue
+
+        row[RECOMPUTE_STAGE_COL] = PHASE_UNKNOWN
+
+    ambiguous_dx_indices = defaultdict(list)
+    dw_indices = defaultdict(list)
+    for idx, row in enumerate(rows):
+        kernel_idx = row.get('__kernel_index')
+        type_val = row.get('Type', '')
+        if kernel_idx is None or kernel_idx <= last_loss_idx or not is_matmul_or_grouped(type_val):
+            continue
+
+        forward_key = get_matmul_forward_key(row)
+        forward_like = forward_key in forward_matmul_keys
+        backward_key, role = choose_semantic_backward_match(row, forward_matmul_keys)
+        if role == 'dw' and backward_key is not None:
+            dw_indices[backward_key].append(idx)
+        elif role == 'dx' and backward_key is not None and forward_like:
+            ambiguous_dx_indices[backward_key].append(idx)
+
+    assigned_dx_indices = set()
+    for backward_key, dw_idx_list in dw_indices.items():
+        candidates = ambiguous_dx_indices.get(backward_key, [])
+        for dw_idx in sorted(dw_idx_list):
+            candidate_idx = next(
+                (candidate for candidate in reversed(candidates)
+                 if candidate < dw_idx and candidate not in assigned_dx_indices),
+                None
+            )
+            if candidate_idx is None:
+                continue
+
+            rows[candidate_idx][RECOMPUTE_STAGE_COL] = PHASE_BACKWARD
+            rows[candidate_idx]['backward_role'] = 'dx'
+            rows[candidate_idx]['backward_parent_key'] = repr(backward_key)
+            assigned_dx_indices.add(candidate_idx)
 
 
 def refine_backward_stages_by_shape(rows: List[Dict[str, Any]]) -> None:
@@ -410,6 +685,7 @@ def classify_matmul_recompute_by_backward_counts(rows: List[Dict[str, Any]]) -> 
 
 def process_kernel_details(csv_path: Path, device_flops: float) -> List[Dict[str, Any]]:
     results = []
+    loss_indices = []
 
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
@@ -418,8 +694,11 @@ def process_kernel_details(csv_path: Path, device_flops: float) -> List[Dict[str
         if not headers:
             return results
 
-        for row in reader:
+        for kernel_idx, row in enumerate(reader):
             type_val = row.get('Type', '')
+            loss_text = f"{row.get('Name', '')} {type_val}".lower()
+            if 'loss' in loss_text:
+                loss_indices.append(kernel_idx)
 
             is_grouped = type_val.startswith('GroupedMatmul')
             is_matmul = (type_val.startswith('MatMulV') or
@@ -469,10 +748,11 @@ def process_kernel_details(csv_path: Path, device_flops: float) -> List[Dict[str
             result_row['I'] = _round(I) if I is not None else ''
             result_row['AI'] = device_flops / 4.0
             result_row['source_path'] = csv_path.parent.parent.name if csv_path else ''
+            result_row['__kernel_index'] = kernel_idx
 
             results.append(result_row)
 
-    infer_recompute_stages(results)
+    infer_recompute_stages(results, loss_indices)
     return results
 
 
@@ -511,6 +791,19 @@ def get_model_runtime(csv_files: List[Path]) -> float:
     return 0.0
 
 
+def find_loss_indices(csv_path: Path) -> List[int]:
+    loss_indices = []
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            for idx, row in enumerate(csv.DictReader(f)):
+                text = f"{row.get('Name', '')} {row.get('Type', '')}".lower()
+                if 'loss' in text:
+                    loss_indices.append(idx)
+    except Exception as e:
+        print(f"Error reading loss anchors from {csv_path}: {e}")
+    return loss_indices
+
+
 def get_group_key(row: Dict[str, Any]) -> str:
     type_val = row.get('Type', '')
     if type_val.startswith('MatMul') or type_val.startswith('GroupedMatmul'):
@@ -524,8 +817,8 @@ def get_group_key(row: Dict[str, Any]) -> str:
 
 def get_statistics_group_key(row: Dict[str, Any]) -> str:
     phase = row.get(RECOMPUTE_STAGE_COL, PHASE_FORWARD)
-    if phase not in {PHASE_FORWARD, PHASE_RECOMPUTE, PHASE_BACKWARD}:
-        phase = PHASE_FORWARD
+    if phase not in KNOWN_PHASES:
+        phase = PHASE_UNKNOWN
     return f"{get_group_key(row)}|{phase}"
 
 
@@ -574,27 +867,7 @@ def _shape_tuple(shape: List[int]) -> Tuple[int, ...]:
 
 
 def get_matmul_io_key(row: Dict[str, Any]) -> Optional[Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]]:
-    type_val = row.get('Type', '')
-    if not is_matmul_or_grouped(type_val):
-        return None
-
-    input_tensors = parse_shape_string(row.get('Input Shapes', ''))
-    output_tensors = parse_shape_string(row.get('Output Shapes', ''))
-    if len(input_tensors) < 2 or not output_tensors:
-        return None
-
-    activation_shape = input_tensors[0]
-    weight_shape = input_tensors[1]
-    output_shape = output_tensors[0]
-    if not activation_shape or not weight_shape or not output_shape:
-        return None
-
-    return (
-        get_matmul_family(type_val),
-        _shape_tuple(activation_shape),
-        _shape_tuple(weight_shape),
-        _shape_tuple(output_shape),
-    )
+    return get_matmul_forward_key(row)
 
 
 def get_backward_role_for_io_key(row: Dict[str, Any],
@@ -605,34 +878,9 @@ def get_backward_role_for_io_key(row: Dict[str, Any],
 
 def get_backward_role_and_priority_for_io_key(row: Dict[str, Any],
                                               io_key: Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]) -> Tuple[Optional[str], int]:
-    type_val = row.get('Type', '')
-    if not is_matmul_or_grouped(type_val):
-        return None, 99
-
-    family, activation_shape, weight_shape, output_shape = io_key
-    if get_matmul_family(type_val) != family:
-        return None, 99
-
-    input_tensors = [_shape_tuple(t) for t in parse_shape_string(row.get('Input Shapes', '')) if t]
-    output_tensors = [_shape_tuple(t) for t in parse_shape_string(row.get('Output Shapes', '')) if t]
-    if not input_tensors or not output_tensors:
-        return None, 99
-
-    grad_output_shape = output_tensors[0]
-    has_forward_output = output_shape in input_tensors
-    has_activation = activation_shape in input_tensors
-    has_weight = weight_shape in input_tensors
-
-    if not is_weight_grad_like(row):
-        if grad_output_shape == activation_shape and has_forward_output and has_weight:
-            return 'dx', 0
-        return None, 99
-
-    if grad_output_shape == weight_shape and has_activation and has_forward_output:
-        return 'dw', 0
-    if family == 'MatMul' and len(weight_shape) == 2 and grad_output_shape == (weight_shape[1], weight_shape[0]) and has_activation and has_forward_output:
-        return 'dw', 1
-    return None, 99
+    role = get_matmul_backward_role_for_forward_key(row, io_key)
+    priority = 0 if role == 'dx' else 1 if role == 'dw' else 99
+    return role, priority
 
 
 def choose_backward_io_match(row: Dict[str, Any],
@@ -658,6 +906,31 @@ def choose_backward_io_match(row: Dict[str, Any],
 def describe_io_key(io_key: Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]) -> str:
     family, activation_shape, weight_shape, output_shape = io_key
     return f"{family}(A={activation_shape}, W={weight_shape}, Out={output_shape})"
+
+
+def parse_stored_io_key(value: Any) -> Optional[Tuple[str, Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]]:
+    if not value:
+        return None
+    try:
+        import ast
+        parsed = ast.literal_eval(value)
+    except (ValueError, SyntaxError):
+        return None
+
+    if not isinstance(parsed, tuple) or len(parsed) != 4:
+        return None
+    family, activation_shape, weight_shape, output_shape = parsed
+    if not isinstance(family, str):
+        return None
+    try:
+        return (
+            family,
+            tuple(int(v) for v in activation_shape),
+            tuple(int(v) for v in weight_shape),
+            tuple(int(v) for v in output_shape),
+        )
+    except TypeError:
+        return None
 
 
 def get_first_start_time(items: List[Dict[str, Any]]) -> float:
@@ -693,7 +966,10 @@ def get_matmul_relationships(group_records: List[Dict[str, Any]]) -> Dict[Tuple[
 
         record['backward_role'] = None
         if record['stage'] == PHASE_BACKWARD:
-            io_key, role = choose_backward_io_match(row, forward_io_keys)
+            io_key = parse_stored_io_key(row.get('backward_parent_key', ''))
+            role = row.get('backward_role') if io_key is not None else None
+            if io_key is None or role not in {'dx', 'dw'}:
+                io_key, role = choose_backward_io_match(row, forward_io_keys)
             record['io_key'] = io_key
             record['backward_role'] = role
             if io_key is not None and role is not None:
@@ -868,7 +1144,7 @@ def validate_matmul_backward_counts(all_results: List[Dict[str, Any]]) -> List[s
             continue
 
         phase = row.get(RECOMPUTE_STAGE_COL, PHASE_FORWARD)
-        if phase == PHASE_BACKWARD:
+        if phase in {PHASE_BACKWARD, PHASE_UNKNOWN}:
             continue
 
         io_key = get_matmul_io_key(row)
@@ -887,7 +1163,10 @@ def validate_matmul_backward_counts(all_results: List[Dict[str, Any]]) -> List[s
         if not is_matmul_or_grouped(type_val) or row.get(RECOMPUTE_STAGE_COL) != PHASE_BACKWARD:
             continue
 
-        io_key, role = choose_backward_io_match(row, forward_io_keys)
+        io_key = parse_stored_io_key(row.get('backward_parent_key', ''))
+        role = row.get('backward_role') if io_key is not None else None
+        if io_key is None or role not in {'dx', 'dw'}:
+            io_key, role = choose_backward_io_match(row, forward_io_keys)
         if io_key is not None and role is not None:
             backward_counts[io_key][role] += 1
 
@@ -899,10 +1178,10 @@ def validate_matmul_backward_counts(all_results: List[Dict[str, Any]]) -> List[s
 
         dx_count = backward_counts[io_key].get('dx', 0)
         dw_count = backward_counts[io_key].get('dw', 0)
-        if dx_count != forward_count or dw_count != forward_count:
+        if dx_count < forward_count or dw_count < forward_count:
             warnings.append(
                 f"{describe_io_key(io_key)} forward={forward_count:g}, recompute={recompute_counts.get(io_key, 0):g}, "
-                f"dx={dx_count:g}, dw={dw_count:g}, expected_dx=expected_dw={forward_count:g}"
+                f"dx={dx_count:g}, dw={dw_count:g}, expected_at_least={forward_count:g}"
             )
 
     return warnings
@@ -972,7 +1251,7 @@ def build_operator_output(all_results: List[Dict[str, Any]],
         'contribution_to_model_hfu',
     ]
     excluded_cols = set(metric_cols + ['stat_type'])
-    output_headers = [h for h in original_headers if h not in excluded_cols] + metric_cols
+    output_headers = [h for h in original_headers if h not in excluded_cols and h not in INTERNAL_COLUMNS] + metric_cols
 
     output_rows = []
     for row in all_results:
@@ -989,9 +1268,9 @@ def build_operator_output(all_results: List[Dict[str, Any]],
         output_row['contribution_to_model_mfu'] = ''
         output_row['contribution_to_model_hfu'] = ''
         if contribution_value != '':
-            if phase == PHASE_RECOMPUTE:
+            if phase in {PHASE_RECOMPUTE, PHASE_UNKNOWN}:
                 output_row['contribution_to_model_hfu'] = contribution_value
-            else:
+            elif phase in {PHASE_FORWARD, PHASE_BACKWARD}:
                 output_row['contribution_to_model_mfu'] = contribution_value
 
         output_rows.append(output_row)
@@ -1076,9 +1355,9 @@ def compute_statistics(all_results: List[Dict[str, Any]], headers: List[str], mo
         avg_row['total_duration(us)'] = total_duration
         avg_row['model_runtime(us)'] = model_runtime
         avg_row['time_ratio(%)'] = _round(time_ratio)
-        if group_stage == PHASE_RECOMPUTE:
+        if group_stage in {PHASE_RECOMPUTE, PHASE_UNKNOWN}:
             avg_row['contribution_to_model_hfu'] = contribution_value
-        else:
+        elif group_stage in {PHASE_FORWARD, PHASE_BACKWARD}:
             avg_row['contribution_to_model_mfu'] = contribution_value
 
         group_records.append({
@@ -1145,7 +1424,23 @@ def main():
     for csv_file in csv_files:
         print(f"Processing: {csv_file.parent.parent.name}")
         results = process_kernel_details(csv_file, device_flops)
+        loss_indices = find_loss_indices(csv_file)
+        diagnostics = get_stage_diagnostics(results, loss_indices)
+        phase_counts = diagnostics['phase_counts']
         print(f"  Found {len(results)} matching operators")
+        print(
+            "  Stage inference: "
+            f"forward={phase_counts.get(PHASE_FORWARD, 0)}, "
+            f"recompute={phase_counts.get(PHASE_RECOMPUTE, 0)}, "
+            f"backward={phase_counts.get(PHASE_BACKWARD, 0)}, "
+            f"unknown={phase_counts.get(PHASE_UNKNOWN, 0)}, "
+            f"loss_count={diagnostics['loss_count']}, "
+            f"first_loss={diagnostics['first_loss_index']}, "
+            f"last_loss={diagnostics['last_loss_index']}, "
+            f"first_backward_extracted={diagnostics['first_backward_extracted_index']}"
+        )
+        if phase_counts.get(PHASE_RECOMPUTE, 0) == 0 and diagnostics['loss_count']:
+            print("  WARNING: loss anchors exist but no recompute operators were inferred")
         all_results.extend(results)
 
     if not all_results:
